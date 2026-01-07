@@ -1,0 +1,106 @@
+  // Pick and send image
+  Future<void> _pickAndSendImage() async {
+    try {
+      final XFile? image = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1920,
+        maxHeight: 1080,
+        imageQuality: 85,
+      );
+
+      if (image == null) return;
+
+      setState(() {
+        _isUploading = true;
+      });
+
+      // Upload to Cloudinary
+      final imageUrl = await CloudinaryService.uploadImage(image.path);
+
+      if (imageUrl == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Failed to upload image')),
+          );
+        }
+        setState(() {
+          _isUploading = false;
+        });
+        return;
+      }
+
+      // Send image message
+      await _sendImageMessage(imageUrl);
+
+      setState(() {
+        _isUploading = false;
+      });
+    } catch (e) {
+      print('Error picking/uploading image: $e');
+      setState(() {
+        _isUploading = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
+    }
+  }
+
+  // Send image message to Firestore
+  Future<void> _sendImageMessage(String imageUrl) async {
+    if (widget.chatType == 'ai') {
+      // Add image to AI chat locally
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            text: '[Image]',
+            senderId: _currentUserId,
+            senderName: _currentUserName,
+            timestamp: DateTime.now(),
+            isMe: true,
+            imageUrl: imageUrl,
+          ),
+        );
+      });
+      await _saveLocalMessages();
+      _scrollToBottom();
+    } else {
+      // Send to Firestore for friend chat
+      final friendUid = widget.friendUid;
+      if (friendUid == null) return;
+
+      final chatId = _getChatId();
+      
+      await FirebaseFirestore.instance
+          .collection('chats')
+          .doc(chatId)
+          .collection('messages')
+          .add({
+        'text': '[Image]',
+        'imageUrl': imageUrl,
+        'senderId': _currentUserId,
+        'senderName': _currentUserName,
+        'receiverId': friendUid,
+        'timestamp': FieldValue.serverTimestamp(),
+        'isRead': false,
+      });
+
+      // Update last message
+      await FirebaseFirestore.instance.collection('chats').doc(chatId).set({
+        'lastMessage': '📷 Photo',
+        'lastTimestamp': FieldValue.serverTimestamp(),
+        'lastSenderId': _currentUserId,
+        'lastSenderName': _currentUserName,
+        'participantNames': {
+          _currentUserId: _currentUserName,
+          friendUid: widget.friendName ?? 'User',
+        },
+        'participants': [_currentUserId, friendUid],
+        'unreadCounts.$friendUid': FieldValue.increment(1),
+      }, SetOptions(merge: true));
+
+      _scrollToBottom();
+    }
+  }
