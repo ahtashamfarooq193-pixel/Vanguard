@@ -1,38 +1,54 @@
-import 'package:cloudinary_sdk/cloudinary_sdk.dart';
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
 
 class CloudinaryService {
-  static final Cloudinary _cloudinary = Cloudinary.full(
-    apiKey: '313454519513523',
-    apiSecret: '6POw3i5oN2FlDmB483N9kcaFPBk',
-    cloudName: 'dgrsdfnzu',
-  );
+  // ── CONFIGURATION ──
+  // TODO: Replace these with your real Cloudinary credentials
+  static const String _cloudName = "dujhxsxnt"; 
+  static const String _uploadPreset = "vanguard_preset"; 
 
-  /// Upload image to Cloudinary and return the URL
-  static Future<String?> uploadImage(String filePath) async {
+  static String? _lastErrorMessage;
+  static String? get lastErrorMessage => _lastErrorMessage;
+
+  /// Uploads a file to Cloudinary using an Unsigned Upload Preset.
+  /// Returns the secure URL of the uploaded image or null on failure.
+  static Future<String?> uploadFile(File file) async {
+    _lastErrorMessage = null;
+
+    if (!await file.exists()) {
+      _lastErrorMessage = "File does not exist.";
+      return null;
+    }
+
     try {
-      final response = await _cloudinary.uploadResource(
-        CloudinaryUploadResource(
-          filePath: filePath,
-          folder: 'chat_images',
-          resourceType: CloudinaryResourceType.image,
-        ),
-      );
+      // Use 'auto/upload' to let Cloudinary detect Image vs Video
+      final url = Uri.parse("https://api.cloudinary.com/v1_1/$_cloudName/auto/upload");
 
-      if (response.isSuccessful && response.secureUrl != null) {
-        print('Upload successful: ${response.secureUrl}');
-        return response.secureUrl;
+      // We use MultipartRequest for file uploads
+      final request = http.MultipartRequest("POST", url)
+        ..fields['upload_preset'] = _uploadPreset
+        ..files.add(await http.MultipartFile.fromPath('file', file.path));
+
+      final response = await request.send().timeout(const Duration(seconds: 30));
+      final responseData = await response.stream.bytesToString();
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final Map<String, dynamic> data = jsonDecode(responseData);
+        final String secureUrl = data['secure_url'];
+        debugPrint('✅ Cloudinary Upload Success: $secureUrl');
+        return secureUrl;
       } else {
-        print('Upload failed: ${response.error}');
+        final Map<String, dynamic> errorData = jsonDecode(responseData);
+        _lastErrorMessage = errorData['error']?['message'] ?? "Upload failed with status: ${response.statusCode}";
+        debugPrint('❌ Cloudinary Error: $_lastErrorMessage');
         return null;
       }
     } catch (e) {
-      print('Error uploading to Cloudinary: $e');
+      _lastErrorMessage = "Cloudinary connection error: $e";
+      debugPrint('❌ Cloudinary Catch: $e');
       return null;
     }
-  }
-
-  /// Get optimized image URL
-  static String getOptimizedUrl(String publicId, {int? width, int? height}) {
-    return 'https://res.cloudinary.com/dgrsdfnzu/image/upload/w_${width ?? 800},h_${height ?? 600},c_limit,q_auto,f_auto/$publicId';
   }
 }

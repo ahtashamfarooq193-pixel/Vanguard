@@ -1,6 +1,6 @@
 {
-    "name": "my_app1",
-    "short_name": "my_app1",
+    "name": "Vanguard",
+    "short_name": "Vanguard",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

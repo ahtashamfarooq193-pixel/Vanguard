@@ -1,1733 +1,318 @@
 import 'dart:async';
-import 'dart:math';
-import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:video_player/video_player.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:my_app1/services/cloudinary_service.dart';
+import 'package:my_app1/services/fcm_service.dart';
 import 'package:my_app1/bottombar.dart';
 import 'package:my_app1/Dashboard/homepage.dart';
 import 'package:my_app1/Dashboard/location.dart';
 import 'package:my_app1/Dashboard/profile.dart';
-import 'package:image_picker/image_picker.dart';
-import 'package:my_app1/services/cloudinary_service.dart';
-import 'package:my_app1/services/notification_service.dart';
+import 'package:intl/intl.dart';
+
+// ════════════════════════════════════════════════════════════════
+//  DATA MODEL
+// ════════════════════════════════════════════════════════════════
+enum MessageStatus { sent, delivered, seen }
 
 class ChatMessage {
+  final String id;
   final String text;
   final String senderId;
   final String senderName;
-  final DateTime timestamp;
+  final int timestamp;
   final bool isMe;
-  final bool isRead;
   final String? imageUrl;
-  final String? senderProfileUrl;
+  final bool isLocation;
+  final double? lat;
+  final double? lng;
+  final String? alertType;
+  MessageStatus status;
 
   ChatMessage({
+    required this.id,
     required this.text,
     required this.senderId,
     required this.senderName,
     required this.timestamp,
     required this.isMe,
-    this.isRead = true,
     this.imageUrl,
-    this.senderProfileUrl,
+    this.isLocation = false,
+    this.lat,
+    this.lng,
+    this.alertType,
+    this.status = MessageStatus.sent,
   });
 
-  // storage
-  Map<String, dynamic> toJson() {
-    return {
-      'text': text,
-      'senderId': senderId,
-      'senderName': senderName,
-      'timestamp': timestamp.toIso8601String(),
-      'isMe': isMe,
-      'imageUrl': imageUrl,
-      'senderProfileUrl': senderProfileUrl,
-    };
-  }
+  bool get isImage => imageUrl != null && imageUrl!.isNotEmpty;
 
-  // Create from Firestore
-  factory ChatMessage.fromFirestore(DocumentSnapshot doc, String currentUserId) {
-    final data = doc.data() as Map<String, dynamic>;
-    final senderId = data['senderId'] ?? '';
+  factory ChatMessage.fromMap(String id, Map<dynamic, dynamic> map, String myId) {
+    MessageStatus s = MessageStatus.sent;
+    final raw = map['status'];
+    if (raw == 'delivered') s = MessageStatus.delivered;
+    if (raw == 'seen') s = MessageStatus.seen;
     return ChatMessage(
-      text: data['text'] ?? '',
-      senderId: senderId,
-      senderName: data['senderName'] ?? '',
-      timestamp: (data['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now(),
-      isMe: senderId == currentUserId,
-      isRead: data['isRead'] ?? false,
-      imageUrl: data['imageUrl'],
-      senderProfileUrl: data['senderProfileUrl'] ?? data['senderPhotoUrl'],
+      id: id,
+      text: (map['text'] ?? '').toString(),
+      senderId: (map['senderId'] ?? '').toString(),
+      senderName: (map['senderName'] ?? '').toString(),
+      timestamp: (map['timestamp'] is int) ? map['timestamp'] : 0,
+      isMe: map['senderId'] == myId,
+      imageUrl: (map['imageUrl'] ?? '').toString().isEmpty ? null : map['imageUrl'].toString(),
+      isLocation: map['isLocation'] == true,
+      lat: map['lat'] != null ? double.tryParse(map['lat'].toString()) : null,
+      lng: map['lng'] != null ? double.tryParse(map['lng'].toString()) : null,
+      alertType: map['alertType']?.toString(),
+      status: s,
     );
   }
 
-  // Create from JSON (for local storage)
-  factory ChatMessage.fromJson(Map<String, dynamic> json) {
-    return ChatMessage(
-      text: json['text'] ?? '',
-      senderId: json['senderId'] ?? '',
-      senderName: json['senderName'] ?? '',
-      timestamp: json['timestamp'] != null 
-          ? DateTime.parse(json['timestamp']) 
-          : DateTime.now(),
-      isMe: json['isMe'] ?? false,
-      isRead: json['isRead'] ?? true,
-      imageUrl: json['imageUrl'],
-      senderProfileUrl: json['senderProfileUrl'],
-    );
+  String get formattedTime {
+    if (timestamp == 0) return '';
+    final dt = DateTime.fromMillisecondsSinceEpoch(timestamp);
+    return DateFormat('hh:mm a').format(dt);
   }
 }
 
-// Chat Selection Screen - Shows when clicking chat icon
+// ════════════════════════════════════════════════════════════════
+//  PRESENCE SERVICE
+// ════════════════════════════════════════════════════════════════
+class PresenceService {
+  static late FirebaseDatabase _db;
+
+  static void init() {
+    _db = FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL: 'https://emergency-alert-9cff6-default-rtdb.asia-southeast1.firebasedatabase.app',
+    );
+  }
+
+  static void setOnline(String uid) {
+    final ref = _db.ref('presence/$uid');
+    ref.set({'online': true, 'lastSeen': ServerValue.timestamp});
+    ref.onDisconnect().set({'online': false, 'lastSeen': ServerValue.timestamp});
+  }
+
+  static Stream<DatabaseEvent> watchPresence(String uid) {
+    return _db.ref('presence/$uid').onValue;
+  }
+
+  static String formatLastSeen(int? timestamp) {
+    if (timestamp == null || timestamp == 0) return 'Offline';
+    final dt = DateTime.fromMillisecondsSinceEpoch(timestamp);
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+
+    if (diff.inSeconds < 60) return 'Just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    return DateFormat('MMM d, hh:mm a').format(dt);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  CHAT SELECTION SCREEN
+// ════════════════════════════════════════════════════════════════
 class ChatSelectionScreen extends StatefulWidget {
   const ChatSelectionScreen({super.key});
-
   @override
   State<ChatSelectionScreen> createState() => _ChatSelectionScreenState();
 }
 
 class _ChatSelectionScreenState extends State<ChatSelectionScreen> {
-  List<Map<String, dynamic>> _friends = []; // Friends list with UID and name
-  int _selectedIndex = 1; // Chat is selected (index 1)
-  String _currentUserId = '';
-  String _currentUserName = 'User';
-  final Map<String, String> _userNames = {}; // Cache for participant names (uid -> name)
-  final Map<String, String?> _userProfiles = {}; // Cache for participant profiles (uid -> url)
-  StreamSubscription<QuerySnapshot>? _chatsSubscription;
-  DateTime? _lastNotificationCheck;
+  final _auth = FirebaseAuth.instance;
+  final _firestore = FirebaseFirestore.instance;
+  late final FirebaseDatabase _db;
+  final int _selectedIndex = 1;
+  final _imagePicker = ImagePicker();
 
   @override
   void initState() {
     super.initState();
-    _initUser();
-    _loadFriends();
-    _setupNotificationListener();
-    _lastNotificationCheck = DateTime.now();
-    _initializeUnreadCounts(); // Fix all existing chats
-  }
-  
-  // Initialize unreadCounts for all chats that don't have it
-  Future<void> _initializeUnreadCounts() async {
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) return;
-      
-      print('DEBUG - Initializing unreadCounts for all chats...');
-      
-      final chatsSnapshot = await FirebaseFirestore.instance
-          .collection('chats')
-          .where('participants', arrayContains: user.uid)
-          .get();
-      
-      for (var chatDoc in chatsSnapshot.docs) {
-        final data = chatDoc.data();
-        
-        // Check if unreadCounts exists
-        if (data['unreadCounts'] == null) {
-          print('DEBUG - Chat ${chatDoc.id} missing unreadCounts, initializing...');
-          
-          final participants = List<String>.from(data['participants'] ?? []);
-          Map<String, int> initialCounts = {};
-          
-          // Initialize all participants with 0
-          for (var participantId in participants) {
-            initialCounts[participantId] = 0;
-          }
-          
-          await chatDoc.reference.update({
-            'unreadCounts': initialCounts,
-          });
-          
-          print('DEBUG - Initialized unreadCounts for chat ${chatDoc.id}');
-        }
-      }
-      
-      print('DEBUG - Finished initializing unreadCounts');
-    } catch (e) {
-      print('Error initializing unreadCounts: $e');
-    }
-  }
-
-  @override
-  void dispose() {
-    _chatsSubscription?.cancel();
-    super.dispose();
-  }
-
-  void _setupNotificationListener() {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
-
-    _chatsSubscription = FirebaseFirestore.instance
-        .collection('chats')
-        .where('participants', arrayContains: user.uid)
-        .snapshots()
-        .listen((snapshot) {
-      if (_lastNotificationCheck == null) return;
-
-      for (var change in snapshot.docChanges) {
-        if (change.type == DocumentChangeType.modified || change.type == DocumentChangeType.added) {
-          final data = change.doc.data() as Map<String, dynamic>;
-          final lastSenderId = data['lastSenderId'];
-          final lastTimestamp = data['lastTimestamp'] as Timestamp?;
-          
-          if (lastSenderId != null && lastSenderId != user.uid && lastTimestamp != null) {
-            final msgTime = lastTimestamp.toDate();
-            if (msgTime.isAfter(_lastNotificationCheck!)) {
-              _lastNotificationCheck = msgTime;
-              final senderName = data['lastSenderName'] ?? 'Someone';
-              final message = data['lastMessage'] ?? 'sent a message';
-              
-              if (mounted) {
-                // Clear previous snackbar first
-                ScaffoldMessenger.of(context).clearSnackBars();
-                
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text('$senderName: $message'),
-                    behavior: SnackBarBehavior.floating,
-                    backgroundColor: const Color(0xff250D57),
-                    duration: const Duration(seconds: 2),
-                    dismissDirection: DismissDirection.horizontal, // Enable swipe to dismiss
-                    margin: EdgeInsets.only(
-                      bottom: MediaQuery.of(context).size.height - 100,
-                      left: 10,
-                      right: 10,
-                    ),
-                    action: SnackBarAction(
-                      label: 'View',
-                      textColor: const Color(0xff38B6FF),
-                      onPressed: () {
-                        // Optional: Navigate to chat if not already there
-                      },
-                    ),
-                  ),
-                );
-              }
-            }
-          }
-        }
-      }
-    });
-  }
-
-  Future<void> _initUser() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      String name = user.displayName ?? 'User';
-      try {
-        final doc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
-        if (doc.exists) {
-          name = doc.data()?['fullName'] ?? doc.data()?['username'] ?? name;
-        }
-      } catch (e) {
-        print('Error fetching current user name: $e');
-      }
-      if (mounted) {
-        setState(() {
-          _currentUserId = user.uid;
-          _currentUserName = name;
-        });
-      }
-    }
-  }
-
-  // Load friends from local storage
-  Future<void> _loadFriends() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final friendsJson = prefs.getString('friends_list');
-
-      List<Map<String, dynamic>> loadedFriends = [];
-      if (friendsJson != null) {
-        final List<dynamic> friendsList = json.decode(friendsJson);
-        loadedFriends = friendsList.map((f) => Map<String, dynamic>.from(f)).toList();
-      }
-
-      // Automatically add Shamii if not present
-      const shamiiEmail = 'shamii9145@gmail.com';
-      bool hasShamii = loadedFriends.any((f) => f['email'] == shamiiEmail);
-
-      if (!hasShamii) {
-        // Try to fetch Shamii's UID from Firestore
-        try {
-          final querySnapshot = await FirebaseFirestore.instance
-              .collection('users')
-              .where('email', isEqualTo: shamiiEmail)
-              .get();
-          
-          if (querySnapshot.docs.isNotEmpty) {
-            final userData = querySnapshot.docs.first.data();
-            loadedFriends.add({
-              'name': userData['fullName'] ?? userData['username'] ?? 'Shamii',
-              'uid': userData['uid'],
-              'email': shamiiEmail,
-            });
-          } else {
-            // Default Shamii if user is not in Firestore yet
-            loadedFriends.add({
-              'name': 'Shamii',
-              'uid': 'shamii_default_uid', // This will be updated once they register
-              'email': shamiiEmail,
-            });
-          }
-        } catch (e) {
-          print('Error fetching Shamii from Firestore: $e');
-        }
-      }
-
-      setState(() {
-        _friends = loadedFriends;
-      });
-      
-      // Save updated list
-      if (!hasShamii) {
-        await _saveFriends();
-      }
-    } catch (e) {
-      print('Error loading friends: $e');
-    }
-  }
-
-  Future<void> _saveFriends() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final friendsJson = json.encode(_friends);
-      await prefs.setString('friends_list', friendsJson);
-    } catch (e) {
-      print('Error saving friends: $e');
-    }
-  }
-
-
-
-  Future<void> _fetchAndSetUserInfo(String uid) async {
-    if (_userNames.containsKey(uid) && _userProfiles.containsKey(uid)) return;
-    try {
-      final doc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
-      if (doc.exists && mounted) {
-        setState(() {
-          _userNames[uid] = doc.data()?['fullName'] ?? doc.data()?['username'] ?? 'User';
-          _userProfiles[uid] = doc.data()?['profileImageUrl'] ?? doc.data()?['photoURL'];
-        });
-      }
-    } catch (e) {
-      print('Error fetching info for $uid: $e');
-    }
-  }
-
-  Widget _buildChatTile(BuildContext context, String uid, String name, String lastMessage, DateTime? time, {int? unreadCount, String? profileUrl}) {
-    name = _userNames[uid] ?? name;
-    return InkWell(
-      onTap: () {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (context) => Chat(
-              chatType: 'friend',
-              friendName: name,
-              friendUid: uid,
-            ),
-          ),
-        );
-      },
-      child: Container(
-        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(12),
-          boxShadow: [
-            BoxShadow(color: Colors.grey.withOpacity(0.1), spreadRadius: 1, blurRadius: 3, offset: const Offset(0, 1)),
-          ],
-        ),
-        child: Row(
-          children: [
-            CircleAvatar(
-              backgroundColor: Colors.grey[300],
-              backgroundImage: profileUrl != null ? NetworkImage(profileUrl) : null,
-              child: profileUrl == null 
-                  ? Text(name.isNotEmpty ? name[0].toUpperCase() : '?', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black87))
-                  : null,
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  Text(lastMessage, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
-                ],
-              ),
-            ),
-            if (time != null || (unreadCount != null && unreadCount > 0))
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  if (time != null)
-                    Text(
-                      "${time.hour}:${time.minute.toString().padLeft(2, '0')}",
-                      style: TextStyle(fontSize: 10, color: Colors.grey[400]),
-                    ),
-                  if (unreadCount != null && unreadCount > 0)
-                    Container(
-                      margin: const EdgeInsets.only(top: 4),
-                      padding: const EdgeInsets.all(6),
-                      decoration: const BoxDecoration(
-                        color: Colors.red,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Text(
-                        unreadCount.toString(),
-                        style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                ],
-              ),
-          ],
-        ),
-      ),
+    _db = FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL: 'https://emergency-alert-9cff6-default-rtdb.asia-southeast1.firebasedatabase.app',
     );
+    final uid = _auth.currentUser?.uid;
+    if (uid != null) PresenceService.setOnline(uid);
+  }
+
+  String _buildChatId(String friendId) {
+    final myId = _auth.currentUser?.uid ?? '';
+    final ids = [myId, friendId]..sort();
+    return ids.join('_');
   }
 
   @override
   Widget build(BuildContext context) {
+    final uid = _auth.currentUser?.uid ?? 'none';
+
     return Scaffold(
+      backgroundColor: const Color(0xffF0F2F5),
       appBar: AppBar(
-        backgroundColor: Colors.white,
-        elevation: 1,
         automaticallyImplyLeading: false,
-        title: const Text(
-          'Chat',
-          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-        ),
+        backgroundColor: const Color(0xff250D57),
+        elevation: 0,
+        title: const Text('Vanguard Chat', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.person_add, color: Colors.black),
-            onPressed: _showAddFriendDialog,
-            tooltip: 'Add Friend',
-          ),
-        ],
-      ),
-      body: Container(
-        color: Colors.grey[100],
-        child: Column(
-          children: [
-            // Chat with AI option
-            InkWell(
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const Chat(chatType: 'ai'),
-                  ),
-                );
-              },
-              child: Container(
-                margin: const EdgeInsets.all(16),
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(15),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.grey.withOpacity(0.2),
-                      spreadRadius: 1,
-                      blurRadius: 5,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 60,
-                      height: 60,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        gradient: const LinearGradient(
-                          colors: [Color(0xff250D57), Color(0xff38B6FF)],
-                        ),
-                      ),
-                      child: const Icon(
-                        Icons.smart_toy,
-                        color: Colors.white,
-                        size: 30,
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Chat with AI',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.black,
-                            ),
-                          ),
-                          SizedBox(height: 4),
-                          Text(
-                            'Get instant AI assistance',
-                            style: TextStyle(fontSize: 14, color: Colors.grey),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Icon(
-                      Icons.arrow_forward_ios,
-                      color: Colors.grey,
-                      size: 20,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // Friends section (Horizontal or vertical)
-            if (_friends.isNotEmpty) ...[
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Friends & Contacts',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.black87,
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: _showAddFriendDialog,
-                      child: const Text(
-                        'Add New',
-                        style: TextStyle(
-                          color: Color(0xff250D57),
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              SizedBox(
-                height: 100,
-                child: ListView.builder(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  itemCount: _friends.length,
-                  itemBuilder: (context, index) {
-                    final friend = _friends[index];
-                    final name = friend['name'] ?? 'User';
-                    return GestureDetector(
-                      onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (context) => Chat(
-                              chatType: 'friend',
-                              friendName: name,
-                              friendUid: friend['uid'],
-                            ),
-                          ),
-                        );
-                      },
-                      child: Container(
-                        width: 80,
-                        margin: const EdgeInsets.symmetric(horizontal: 4),
-                        child: Column(
-                          children: [
-                            CircleAvatar(
-                              radius: 28,
-                              backgroundColor: Colors.white,
-                              child: CircleAvatar(
-                                radius: 26,
-                                backgroundColor: const Color(0xff38B6FF).withOpacity(0.2),
-                                child: friend['profileUrl'] != null || friend['photoURL'] != null
-                                    ? ClipOval(child: Image.network(friend['profileUrl'] ?? friend['photoURL']!, fit: BoxFit.cover, width: 52, height: 52))
-                                    : Text(
-                                        name.isNotEmpty ? name[0].toUpperCase() : '?',
-                                        style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xff250D57)),
-                                      ),
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              name.split(' ')[0],
-                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
-                              textAlign: TextAlign.center,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-              const Divider(height: 32, thickness: 1, indent: 16, endIndent: 16),
-            ] else ...[
-               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Friends',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                    ),
-                    TextButton(
-                      onPressed: _showAddFriendDialog,
-                      child: const Text('Add Friend', style: TextStyle(color: Color(0xff250D57), fontWeight: FontWeight.bold)),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-
-            // Recent Conversations header
-            const Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text(
-                'Recent Conversations',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.black87,
-                ),
-              ),
-            ),
-
-            // Active Chats from Firestore
-            Expanded(
-              child: FirebaseAuth.instance.currentUser == null
-                  ? const Center(child: CircularProgressIndicator())
-                  : StreamBuilder<QuerySnapshot>(
-                      stream: FirebaseFirestore.instance
-                          .collection('chats')
-                          .where('participants', arrayContains: FirebaseAuth.instance.currentUser!.uid)
-                          .orderBy('lastTimestamp', descending: true)
-                          .snapshots(),
-                builder: (context, snapshot) {
-                  if (snapshot.hasError) {
-                    return Center(child: Text('Error: ${snapshot.error}'));
-                  }
-                  if (snapshot.connectionState == ConnectionState.waiting) {
-                    return const Center(child: CircularProgressIndicator());
-                  }
-
-                  final chatDocs = snapshot.data?.docs ?? [];
-
-                  if (chatDocs.isEmpty && _friends.isEmpty) {
-                    return Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.chat_bubble_outline, size: 64, color: Colors.grey[400]),
-                          const SizedBox(height: 16),
-                          const Text('No conversations yet', style: TextStyle(fontSize: 18, color: Colors.grey, fontWeight: FontWeight.bold)),
-                          Text('Add a friend or wait for a message!', style: TextStyle(color: Colors.grey[500])),
-                        ],
-                      ),
-                    );
-                  }
-
-                  // Merge Firestore chats with local friends to ensure names are shown correctly
-                  return ListView.builder(
-                    itemCount: chatDocs.length,
-                    itemBuilder: (context, index) {
-                      final chatData = chatDocs[index].data() as Map<String, dynamic>;
-                      final participants = List<String>.from(chatData['participants'] ?? []);
-                      final currentUid = FirebaseAuth.instance.currentUser?.uid;
-                      final otherUid = participants.firstWhere((id) => id != currentUid, orElse: () => '');
-                      
-                      if (otherUid.isEmpty) return const SizedBox.shrink();
-
-                      // Try to find the name from local friends or Firestore participants info
-                      // In a real app, we might store participant names in the chat doc or fetch them
-                      String otherName = 'User';
-                      final localFriend = _friends.firstWhere((f) => f['uid'] == otherUid, orElse: () => {});
-                      final participantNames = chatData['participantNames'] as Map<String, dynamic>?;
-                      final participantProfiles = chatData['participantProfiles'] as Map<String, dynamic>?;
-
-                      if (localFriend.isNotEmpty) {
-                        otherName = localFriend['name'] ?? 'User';
-                      } else if (participantNames != null && participantNames.containsKey(otherUid)) {
-                        otherName = participantNames[otherUid].toString();
-                      } else if (_userNames.containsKey(otherUid)) {
-                        otherName = _userNames[otherUid]!;
-                      } else {
-                        otherName = 'Chat User';
-                        _fetchAndSetUserInfo(otherUid);
-                      }
-
-                      String? otherProfile = participantProfiles?[otherUid]?.toString();
-                      if (otherProfile == null && _userProfiles.containsKey(otherUid)) {
-                        otherProfile = _userProfiles[otherUid];
-                      }
-
-                      final unreadCounts = chatData['unreadCounts'] as Map<String, dynamic>?;
-                      final unreadCount = (unreadCounts?[currentUid] as num?)?.toInt() ?? 0;
-                      
-                      // DEBUG: Print to see what's happening
-                      print('DEBUG Chat Tile - Other UID: $otherUid, Current UID: $currentUid');
-                      print('DEBUG UnreadCounts Map: $unreadCounts');
-                      print('DEBUG Extracted Count for $currentUid: $unreadCount');
-
-                      return _buildChatTile(
-                        context,
-                        otherUid,
-                        otherName,
-                        chatData['lastMessage'] ?? 'No messages yet',
-                        (chatData['lastTimestamp'] as Timestamp?)?.toDate(),
-                        unreadCount: unreadCount,
-                        profileUrl: otherProfile,
-                      );
-                    },
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
-      bottomNavigationBar: MyBottomBar(
-        selectedIndex: _selectedIndex,
-        onTap: (index) {
-          if (index == _selectedIndex) return;
-          
-          Widget nextScreen;
-          switch (index) {
-            case 0:
-              nextScreen = HomePage();
-              break;
-            case 1:
-              nextScreen = const ChatSelectionScreen();
-              break;
-            case 2:
-              nextScreen = const Location();
-              break;
-            case 3:
-              nextScreen = const Profile();
-              break;
-            default:
-              nextScreen = const ChatSelectionScreen();
-          }
-
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => nextScreen),
-          );
-        },
-      ),
-    );
-  }
-
-  void _showAddFriendDialog() {
-    final friendController = TextEditingController();
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Add Friend'),
-        content: TextField(
-          controller: friendController,
-          decoration: const InputDecoration(
-            hintText: 'Enter email or phone (+92...)',
-            border: OutlineInputBorder(),
-          ),
-          keyboardType: TextInputType.emailAddress,
-          autofocus: true,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () async {
-              final input = friendController.text.trim().toLowerCase();
-              if (input.isNotEmpty) {
-                // Show loading
-                showDialog(
-                  context: context,
-                  barrierDismissible: false,
-                  builder: (context) => const Center(child: CircularProgressIndicator()),
-                );
-
-                try {
-                  // Search by Email first
-                  var querySnapshot = await FirebaseFirestore.instance
-                      .collection('users')
-                      .where('email', isEqualTo: input)
-                      .get();
-
-                  // If not found, try searching by Phone
-                  if (querySnapshot.docs.isEmpty) {
-                    querySnapshot = await FirebaseFirestore.instance
-                        .collection('users')
-                        .where('phone', isEqualTo: input)
-                        .get();
-                  }
-
-                  if (context.mounted) Navigator.pop(context); // Remove loading
-
-                  String? friendName;
-                  String? friendEmail;
-                  String? friendUid;
-
-                  // Standardized Shamii Fallback
-                  const shamiiEmail = 'shamii9145@gmail.com';
-                  bool isShamii = input == shamiiEmail;
-
-                  if (querySnapshot.docs.isNotEmpty) {
-                    final userData = querySnapshot.docs.first.data();
-                    friendName = (userData['fullName'] ?? userData['username'] ?? userData['email']).toString();
-                    friendEmail = userData['email']?.toString() ?? input;
-                    friendUid = userData['uid']?.toString();
-                  } else if (isShamii) {
-                    // Fallback for Shamii
-                    friendName = 'Shamii';
-                    friendEmail = shamiiEmail;
-                    friendUid = 'shamii_default_uid';
-                  }
-
-                  if (friendUid != null) {
-                    setState(() {
-                      // Check if already in friends by UID or Email
-                      bool alreadyExists = _friends.any((f) => f['uid'] == friendUid || f['email'] == friendEmail);
-                      if (!alreadyExists) {
-                        _friends.add({
-                          'name': friendName!,
-                          'uid': friendUid!,
-                          'email': friendEmail!,
-                        });
-                      }
-                    });
-                    await _saveFriends();
-                    
-                    // Notify the friend that they have been added
-                    try {
-                      await FirebaseFirestore.instance.collection('notifications').add({
-                        'userId': friendUid,
-                        'title': 'New Friend',
-                        'body': '${_currentUserName ?? "A user"} added you as a friend.',
-                        'time': FieldValue.serverTimestamp(),
-                        'icon': 'person_add',
-                        'timestamp': FieldValue.serverTimestamp(),
-                      });
-                    } catch (e) {
-                      print('Error notifying friend: $e');
-                    }
-
-                    if (context.mounted) {
-                      Navigator.pop(context); // Close dialog
-                      // Navigate directly to chat
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) => Chat(
-                            chatType: 'friend',
-                            friendName: friendName,
-                            friendUid: friendUid,
-                          ),
-                        ),
-                      );
-                    }
-                  } else {
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Account not found.')),
-                      );
-                    }
-                  }
-                } catch (e) {
-                  if (context.mounted) Navigator.pop(context); // Remove loading
-                  if (context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Error: $e')),
-                    );
-                  }
-                }
-              }
-            },
-            child: const Text('Add'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// Main Chat Screen
-class Chat extends StatefulWidget {
-  final String chatType; // 'ai' or 'friend'
-  final String? friendName; // Name of friend if chatType is 'friend'
-  final String? friendUid; // UID of friend if chatType is 'friend'
-
-  const Chat({super.key, required this.chatType, this.friendName, this.friendUid});
-
-  @override
-  State<Chat> createState() => _ChatState();
-}
-
-class _ChatState extends State<Chat> {
-  final TextEditingController _messageController = TextEditingController();
-  final ScrollController _scrollController = ScrollController();
-  final List<ChatMessage> _messages = [];
-  String _currentUserId = '';
-  String _currentUserName = '';
-  bool _isTyping = false;
-  bool _isUploading = false; // Track image upload state
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final ImagePicker _imagePicker = ImagePicker(); // Image picker instance
-
-  // AI responses that sound human
-  final List<Map<String, dynamic>> _aiResponses = [
-    {
-      'patterns': [
-        'hello',
-        'hi',
-        'hey',
-        'good morning',
-        'good afternoon',
-        'good evening',
-      ],
-      'responses': [
-        'Hey there! How can I help you today?',
-        'Hello! What\'s on your mind?',
-        'Hi! Nice to chat with you!',
-        'Hey! How are you doing?',
-      ],
-    },
-    {
-      'patterns': ['how are you', 'how do you do', 'what\'s up'],
-      'responses': [
-        'I\'m doing great, thanks for asking! How about you?',
-        'I\'m good! Just here to help. How can I assist you?',
-        'Doing well! What can I do for you today?',
-      ],
-    },
-    {
-      'patterns': ['thank', 'thanks', 'appreciate'],
-      'responses': [
-        'You\'re welcome! Happy to help!',
-        'No problem at all! Anything else?',
-        'My pleasure! Feel free to ask if you need anything.',
-      ],
-    },
-    {
-      'patterns': ['help', 'assist', 'support'],
-      'responses': [
-        'Of course! I\'m here to help. What do you need?',
-        'Sure thing! What can I help you with?',
-        'I\'d be happy to help! Tell me what you need.',
-      ],
-    },
-    {
-      'patterns': ['bye', 'goodbye', 'see you', 'later'],
-      'responses': [
-        'See you later! Take care!',
-        'Goodbye! Have a great day!',
-        'Bye! Chat with you soon!',
-      ],
-    },
-    {
-      'patterns': ['name', 'who are you', 'developer', 'creator', 'made you'],
-      'responses': [
-        'I\'m your AI assistant! I was created by Shamii to help you stay protected and connected.',
-        'My creator is Shamii. I\'m here to assist you with anything you need!',
-        'I\'m a helpful AI assistant developed by Shamii. How can I help you today?',
-      ],
-    },
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _initUser();
-    _resetUnreadCount();
-    _markMessagesAsRead();
-    
-    // Listen for new messages while chat is open to mark them as read immediately
-    if (widget.chatType == 'friend') {
-      final chatId = _getChatId();
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        FirebaseFirestore.instance
-            .collection('chats')
-            .doc(chatId)
-            .collection('messages')
-            .where('receiverId', isEqualTo: user.uid)
-            .where('isRead', isEqualTo: false)
-            .snapshots()
-            .listen((snapshot) {
-              if (mounted) { // Only if screen is still active
-                for (var doc in snapshot.docs) {
-                  doc.reference.update({'isRead': true});
-                }
-              }
-            });
-      }
-    }
-  }
-
-  void _resetUnreadCount() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null || widget.chatType != 'friend') return;
-    
-    final chatId = _getChatId();
-    await FirebaseFirestore.instance.collection('chats').doc(chatId).update({
-      'unreadCounts.${user.uid}': 0,
-    }).catchError((e) => print('Error resetting unread count: $e'));
-  }
-
-  void _markMessagesAsRead() async {
-    final user = _auth.currentUser;
-    if (user == null || widget.chatType != 'friend') return;
-
-    final chatId = _getChatId();
-    final batch = FirebaseFirestore.instance.batch();
-    
-    final unreadMessages = await FirebaseFirestore.instance
-        .collection('chats')
-        .doc(chatId)
-        .collection('messages')
-        .where('receiverId', isEqualTo: user.uid)
-        .where('isRead', isEqualTo: false)
-        .get();
-
-    if (unreadMessages.docs.isEmpty) return;
-
-    for (var doc in unreadMessages.docs) {
-      batch.update(doc.reference, {'isRead': true});
-    }
-    
-    await batch.commit();
-    print('DEBUG: Marked ${unreadMessages.docs.length} messages as read');
-  }
-
-  Future<void> _initUser() async {
-    final user = _auth.currentUser;
-    if (user != null) {
-      String name = user.displayName ?? 'You';
-      
-      // Attempt to get name from Firestore if Auth name is missing
-      try {
-        final userDoc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
-        if (userDoc.exists) {
-          final data = userDoc.data();
-          name = data?['fullName'] ?? data?['username'] ?? name;
-        }
-      } catch (e) {
-        print('Error fetching user name: $e');
-      }
-
-      setState(() {
-        _currentUserId = user.uid;
-        _currentUserName = name;
-      });
-      _loadMessages();
-    }
-  }
-
-  // Get unique ID for this chat
-  String _getChatId() {
-    if (widget.chatType == 'ai') {
-      return 'ai_${_currentUserId}';
-    } else {
-      // Create a deterministic ID from two UIDs
-      List<String> ids = [_currentUserId, widget.friendUid ?? ''];
-      ids.sort();
-      return ids.join('_');
-    }
-  }
-
-  // Load messages
-  Future<void> _loadMessages() async {
-    if (widget.chatType == 'ai') {
-      // AI messages are still local for now as per simple simulation, 
-      // but we could sync them too if needed.
-      _loadLocalMessages();
-    }
-  }
-
-  Future<void> _loadLocalMessages() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final chatId = _getChatId();
-      final messagesJson = prefs.getString('local_chat_$chatId');
-
-      if (messagesJson != null) {
-        final List<dynamic> messagesList = json.decode(messagesJson);
-        setState(() {
-          _messages.clear();
-          _messages.addAll(
-            messagesList.map((msg) => ChatMessage.fromJson(msg)).toList(),
-          );
-        });
-        _scrollToBottom();
-      } else {
-        if (widget.chatType == 'ai') {
-          _addWelcomeMessage();
-          _saveLocalMessages();
-        }
-      }
-    } catch (e) {
-      print('Error loading local messages: $e');
-    }
-  }
-
-  // Save messages locally
-  Future<void> _saveLocalMessages() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final chatId = _getChatId();
-      final messagesJson = json.encode(
-        _messages.map((msg) => msg.toJson()).toList(),
-      );
-      await prefs.setString('local_chat_$chatId', messagesJson);
-    } catch (e) {
-      print('Error saving local messages: $e');
-    }
-  }
-
-  void _addWelcomeMessage() {
-    _messages.add(
-      ChatMessage(
-        text:
-            'Hello! I\'m your AI assistant. Feel free to ask me anything or chat with me!',
-        senderId: 'ai',
-        senderName: 'AI Assistant',
-        timestamp: DateTime.now(),
-        isMe: false,
-      ),
-    );
-  }
-
-  String _getAIResponse(String userMessage) {
-    final lowerMessage = userMessage.toLowerCase();
-
-    // Check for pattern matches
-    for (var responseSet in _aiResponses) {
-      for (var pattern in responseSet['patterns'] as List<String>) {
-        if (lowerMessage.contains(pattern)) {
-          final responses = responseSet['responses'] as List<String>;
-          return responses[Random().nextInt(responses.length)];
-        }
-      }
-    }
-
-    // Default contextual responses
-    final defaultResponses = [
-      'That\'s interesting! Tell me more about that.',
-      'I see what you mean. Can you elaborate?',
-      'Hmm, that\'s a good point. What do you think about it?',
-      'I understand. Is there anything specific you\'d like to know?',
-      'Got it! Anything else you want to discuss?',
-      'That makes sense. How can I help you with that?',
-      'Interesting perspective! What else is on your mind?',
-      'I hear you. Feel free to share more details if you\'d like.',
-    ];
-
-    // Add some variety based on message length
-    if (userMessage.length < 10) {
-      return 'Could you tell me a bit more?';
-    } else if (userMessage.length > 50) {
-      return 'Wow, that\'s a lot of information! Let me think about that...';
-    }
-
-    return defaultResponses[Random().nextInt(defaultResponses.length)];
-  }
-
-  String _getFriendResponse(String userMessage) {
-    // Simulate friend responses
-    final friendResponses = [
-      'That sounds great!',
-      'I agree with you on that.',
-      'Haha, that\'s funny!',
-      'Really? Tell me more!',
-      'I understand what you mean.',
-      'Thanks for sharing that with me.',
-      'That\'s interesting!',
-      'I see, that makes sense.',
-    ];
-    return friendResponses[Random().nextInt(friendResponses.length)];
-  }
-
-  Future<void> _showImageSourceDialog() async {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (context) => Container(
-        padding: const EdgeInsets.symmetric(vertical: 20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              "Select Image Source",
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 20),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                _buildSourceOption(
-                  icon: Icons.camera_alt,
-                  label: "Camera",
-                  onTap: () {
-                    Navigator.pop(context);
-                    _pickAndUploadImage(ImageSource.camera);
-                  },
-                ),
-                _buildSourceOption(
-                  icon: Icons.photo_library,
-                  label: "Gallery",
-                  onTap: () {
-                    Navigator.pop(context);
-                    _pickAndUploadImage(ImageSource.gallery);
-                  },
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSourceOption({required IconData icon, required String label, required VoidCallback onTap}) {
-    return InkWell(
-      onTap: onTap,
-      child: Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(15),
-            decoration: BoxDecoration(
-              color: const Color(0xff38B6FF).withValues(alpha: 0.1),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(icon, color: const Color(0xff38B6FF), size: 30),
-          ),
-          const SizedBox(height: 8),
-          Text(label),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _pickAndUploadImage(ImageSource source) async {
-    try {
-      final XFile? image = await _imagePicker.pickImage(
-        source: source,
-        maxWidth: 1080,
-        maxHeight: 1080,
-        imageQuality: 85,
-      );
-
-      if (image == null) return;
-
-      setState(() {
-        _isUploading = true;
-      });
-
-      // Upload to Cloudinary
-      final imageUrl = await CloudinaryService.uploadImage(image.path);
-
-      if (imageUrl != null) {
-        _sendImageMessage(imageUrl);
-      } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Failed to upload image')),
-          );
-        }
-      }
-    } catch (e) {
-      print('Error picking/uploading image: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isUploading = false;
-        });
-      }
-    }
-  }
-
-  void _sendImageMessage(String imageUrl) async {
-    final user = _auth.currentUser;
-    if (user == null) return;
-
-    final friendUid = widget.friendUid;
-    final chatId = _getChatId();
-    final profileUrl = user.photoURL;
-
-    final newMessage = {
-      'text': '',
-      'imageUrl': imageUrl,
-      'senderId': _currentUserId,
-      'senderName': _currentUserName,
-      'senderProfileUrl': profileUrl,
-      'receiverId': friendUid,
-      'timestamp': FieldValue.serverTimestamp(),
-      'isRead': false,
-    };
-
-    if (widget.chatType == 'ai') {
-      setState(() {
-        _messages.add(
-          ChatMessage(
-            text: '',
-            imageUrl: imageUrl,
-            senderId: _currentUserId,
-            senderName: _currentUserName,
-            senderProfileUrl: profileUrl,
-            timestamp: DateTime.now(),
-            isMe: true,
-          ),
-        );
-      });
-      await _saveLocalMessages();
-      _scrollToBottom();
-      _handleAIResponse("System: User sent an image.");
-    } else {
-      await FirebaseFirestore.instance
-          .collection('chats')
-          .doc(chatId)
-          .collection('messages')
-          .add(newMessage);
-
-      await FirebaseFirestore.instance.collection('chats').doc(chatId).set({
-        'lastMessage': '📷 Image',
-        'lastTimestamp': FieldValue.serverTimestamp(),
-        'lastSenderId': _currentUserId,
-        'participantProfiles': {
-          _currentUserId: profileUrl,
-          friendUid: widget.friendName != null ? null : null, // We might not have friend's profile here, but we can update it if we find it
-        },
-        'unreadCounts.$friendUid': FieldValue.increment(1),
-      }, SetOptions(merge: true));
-
-      _scrollToBottom();
-      if (friendUid != null) {
-        NotificationService.sendPushNotification(
-          recipientUid: friendUid,
-          title: _currentUserName,
-          body: "📷 Image",
-          data: {
-            'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-            'type': 'chat',
-            'senderId': _currentUserId,
-          },
-        );
-      }
-    }
-  }
-
-  void _sendMessage() async {
-    if (_messageController.text.trim().isEmpty) return;
-
-    final messageText = _messageController.text.trim();
-    _messageController.clear();
-
-    if (widget.chatType == 'ai') {
-      setState(() {
-        _messages.add(
-          ChatMessage(
-            text: messageText,
-            senderId: _currentUserId,
-            senderName: _currentUserName,
-            senderProfileUrl: _auth.currentUser?.photoURL,
-            timestamp: DateTime.now(),
-            isMe: true,
-          ),
-        );
-      });
-      await _saveLocalMessages();
-      _scrollToBottom();
-      _handleAIResponse(messageText);
-    } else {
-      // Send to Firestore
-      final friendUid = widget.friendUid;
-      if (friendUid == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Error: Friend ID missing')),
-        );
-        return;
-      }
-
-      final chatId = _getChatId();
-      final newMessage = {
-        'text': messageText,
-        'senderId': _currentUserId,
-        'senderName': _currentUserName,
-        'senderProfileUrl': _auth.currentUser?.photoURL,
-        'receiverId': friendUid,
-        'timestamp': FieldValue.serverTimestamp(),
-      };
-
-      // Send to Firestore
-      await FirebaseFirestore.instance
-          .collection('chats')
-          .doc(chatId)
-          .collection('messages')
-          .add({
-            ...newMessage,
-            'isRead': false,
-          });
-      
-      // Update last message, names, and increment unread count for friend
-      print('DEBUG _sendMessage - Incrementing unread for friend: $friendUid');
-      print('DEBUG _sendMessage - Chat ID: $chatId');
-      
-      // First ensure the chat document exists with proper structure
-      final chatDoc = await FirebaseFirestore.instance.collection('chats').doc(chatId).get();
-      
-      Map<String, dynamic> updateData = {
-        'lastMessage': messageText,
-        'lastTimestamp': FieldValue.serverTimestamp(),
-        'lastSenderId': _currentUserId,
-        'lastSenderName': _currentUserName,
-        'participantNames': {
-          _currentUserId: _currentUserName,
-          friendUid: widget.friendName ?? 'User',
-        },
-        'participantProfiles': {
-          _currentUserId: _auth.currentUser?.photoURL,
-        },
-        'participants': [_currentUserId, friendUid],
-      };
-      
-      // Initialize or increment unread count
-      if (!chatDoc.exists || chatDoc.data()?['unreadCounts'] == null) {
-        // First time - initialize the map
-        print('DEBUG - Initializing unreadCounts map');
-        updateData['unreadCounts'] = {
-          _currentUserId: 0,
-          friendUid: 1, // Friend has 1 unread
-        };
-      } else {
-        // Already exists - just increment
-        updateData['unreadCounts.$friendUid'] = FieldValue.increment(1);
-      }
-      
-      await FirebaseFirestore.instance.collection('chats').doc(chatId).set(
-        updateData,
-        SetOptions(merge: true),
-      );
-      
-      print('DEBUG _sendMessage - Unread count updated for $friendUid');
-
-      // SEND PUSH NOTIFICATION
-      NotificationService.sendPushNotification(
-        recipientUid: friendUid, // friendUid is checked for null at line 1352
-        title: _currentUserName,
-        body: messageText,
-        data: {
-          'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-          'type': 'chat',
-          'senderId': _currentUserId,
-        },
-      );
-
-      _scrollToBottom();
-    }
-  }
-
-  void _handleAIResponse(String messageText) {
-    // Show typing indicator
-    setState(() {
-      _isTyping = true;
-    });
-
-    // Respond after a delay (simulating thinking time)
-    final responseDelay = Duration(milliseconds: 1000 + Random().nextInt(2000));
-    Future.delayed(responseDelay, () async {
-      if (mounted) {
-        setState(() {
-          _isTyping = false;
-          final responseText = _getAIResponse(messageText);
-
-          _messages.add(
-            ChatMessage(
-              text: responseText,
-              senderId: 'ai',
-              senderName: 'AI Assistant',
-              timestamp: DateTime.now(),
-              isMe: false,
-            ),
-          );
-        });
-        // Save messages after receiving response
-        await _saveLocalMessages();
-        _scrollToBottom();
-      }
-    });
-  }
-
-  void _scrollToBottom() {
-    if (_scrollController.hasClients) {
-      Future.delayed(const Duration(milliseconds: 100), () {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    _messageController.dispose();
-    _scrollController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final chatTitle = widget.chatType == 'ai'
-        ? 'AI Assistant'
-        : (widget.friendName ?? 'Friend');
-
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        elevation: 1,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios, color: Colors.black),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: widget.chatType == 'ai'
-                    ? const LinearGradient(
-                        colors: [Color(0xff250D57), Color(0xff38B6FF)],
-                      )
-                    : null,
-                color: widget.chatType == 'friend' ? Colors.grey[300] : null,
-              ),
-              child: widget.chatType == 'ai'
-                  ? const Icon(Icons.smart_toy, color: Colors.white, size: 20)
-                  : Center(
-                      child: Text(
-                        chatTitle.isNotEmpty ? chatTitle[0].toUpperCase() : '?',
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.black87,
-                        ),
-                      ),
-                    ),
-            ),
-            const SizedBox(width: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  chatTitle,
-                  style: const TextStyle(
-                    color: Colors.black,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                Text(
-                  widget.chatType == 'ai' ? 'Online' : 'Last seen recently',
-                  style: const TextStyle(color: Colors.green, fontSize: 12),
-                ),
-              ],
-            ),
-          ],
-        ),
-        iconTheme: const IconThemeData(color: Colors.black),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.more_vert, color: Colors.black),
-            onPressed: () {
-              // Add menu options here if needed
-            },
-          ),
+          IconButton(icon: const Icon(Icons.search, color: Colors.white70), onPressed: () {}),
         ],
       ),
       body: Column(
         children: [
-          // Messages List
-          Expanded(
-            child: Container(
-              color: Colors.grey[100],
-              child: _currentUserId.isEmpty
-                  ? const Center(child: CircularProgressIndicator())
-                  : widget.chatType == 'ai'
-                  ? (_messages.isEmpty
-                      ? const Center(
-                          child: Text(
-                            'No messages yet.\nStart a conversation!',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(color: Colors.grey, fontSize: 16),
-                          ),
-                        )
-                      : ListView.builder(
-                          controller: _scrollController,
-                          padding: const EdgeInsets.all(16.0),
-                          itemCount: _messages.length + (_isTyping ? 1 : 0),
-                          itemBuilder: (context, index) {
-                            if (index == _messages.length && _isTyping) {
-                              return _buildTypingIndicator();
+          Container(
+            height: 125,
+            padding: const EdgeInsets.symmetric(vertical: 15),
+            decoration: const BoxDecoration(
+              color: Color(0xff250D57),
+              borderRadius: BorderRadius.only(bottomLeft: Radius.circular(30), bottomRight: Radius.circular(30)),
+            ),
+            child: StreamBuilder<DocumentSnapshot>(
+              stream: _firestore.collection('users').doc(uid).snapshots(),
+              builder: (ctx, mySnap) {
+                List? myStatuses;
+                String? myPhotoUrl;
+                String myName = 'Me';
+                Map<String, dynamic>? myUserData;
+
+                if (mySnap.hasData && mySnap.data!.exists) {
+                  final md = mySnap.data!.data() as Map<String, dynamic>;
+                  myStatuses = md['statuses'] as List?;
+                  myPhotoUrl = md['photoUrl'];
+                  myName = md['displayName'] ?? md['name'] ?? 'Me';
+                  myUserData = md;
+                }
+
+                return StreamBuilder<QuerySnapshot>(
+                  stream: _firestore.collection('users').doc(uid).collection('contacts').snapshots(),
+                  builder: (ctx, snap) {
+                    final contacts = snap.data?.docs ?? [];
+                    return ListView.builder(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      scrollDirection: Axis.horizontal,
+                      itemCount: contacts.length + 2,
+                      itemBuilder: (_, i) {
+                        if (i == 0) return _addStory();
+                        if (i == 1) return _recentUser(myName, myPhotoUrl, statuses: myStatuses, ownerId: uid, userData: myUserData);
+
+                        final cDoc = contacts[i - 2];
+                        return StreamBuilder<DocumentSnapshot>(
+                          stream: _firestore.collection('users').doc(cDoc.id).snapshots(),
+                          builder: (uCtx, uSnap) {
+                            String? pUrl;
+                            String name = 'User';
+                            List? contactStatuses;
+                            Map<String, dynamic>? contactUserData;
+
+                            if (uSnap.hasData && uSnap.data!.exists) {
+                              final ud = uSnap.data!.data() as Map<String, dynamic>;
+                              pUrl = ud['photoUrl'];
+                              name = ud['displayName'] ?? ud['name'] ?? 'User';
+                              contactStatuses = ud['statuses'] as List?;
+                              contactUserData = ud;
                             }
-                            final message = _messages[index];
-                            return _buildMessageBubble(message, index);
-                          },
-                        ))
-                  : StreamBuilder<QuerySnapshot>(
-                      stream: FirebaseFirestore.instance
-                          .collection('chats')
-                          .doc(_getChatId())
-                          .collection('messages')
-                          .orderBy('timestamp', descending: false)
-                          .snapshots(),
-                      builder: (context, snapshot) {
-                        if (snapshot.hasError) {
-                          return Center(child: Text('Error: ${snapshot.error}'));
-                        }
-                        if (snapshot.connectionState == ConnectionState.waiting) {
-                          return const Center(child: CircularProgressIndicator());
-                        }
-
-                        final docs = snapshot.data?.docs ?? [];
-                        if (docs.isEmpty) {
-                          return const Center(
-                            child: Text(
-                              'No messages yet.\nStart a conversation!',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(color: Colors.grey, fontSize: 16),
-                            ),
-                          );
-                        }
-
-                        // Scroll to bottom when new messages arrive
-                        WidgetsBinding.instance.addPostFrameCallback((_) {
-                          _scrollToBottom();
-                        });
-
-                        return ListView.builder(
-                          controller: _scrollController,
-                          padding: const EdgeInsets.all(16.0),
-                          itemCount: docs.length,
-                          itemBuilder: (context, index) {
-                            final doc = docs[index];
-                            final chatMsg = ChatMessage.fromFirestore(doc, _currentUserId);
-                            return _buildMessageBubble(chatMsg, index, messageId: doc.id);
+                            return _recentUser(name, pUrl, statuses: contactStatuses, ownerId: cDoc.id, userData: contactUserData);
                           },
                         );
                       },
-                    ),
+                    );
+                  }
+                );
+              }
             ),
           ),
-
-          // Typing indicator
-          if (_isTyping)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              alignment: Alignment.centerLeft,
-              child: Text(
-                '${chatTitle} is typing...',
-                style: const TextStyle(
-                  color: Colors.grey,
-                  fontSize: 12,
-                  fontStyle: FontStyle.italic,
-                ),
+          Expanded(
+            child: Container(
+              margin: const EdgeInsets.only(top: 10),
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.only(topLeft: Radius.circular(40), topRight: Radius.circular(40)),
               ),
-            ),
-
-          // Message Input
-          Container(
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.withOpacity(0.2),
-                  spreadRadius: 1,
-                  blurRadius: 5,
-                  offset: const Offset(0, -2),
-                ),
-              ],
-            ),
-            child: SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 8.0,
-                  vertical: 8.0,
-                ),
-                child: Row(
+              child: ClipRRect(
+                borderRadius: const BorderRadius.only(topLeft: Radius.circular(40), topRight: Radius.circular(40)),
+                child: ListView(
+                  padding: const EdgeInsets.symmetric(vertical: 20),
                   children: [
-                    Expanded(
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.grey[200],
-                          borderRadius: BorderRadius.circular(25),
-                        ),
-                        child: TextField(
-                          controller: _messageController,
-                          decoration: const InputDecoration(
-                            hintText: 'Type a message...',
-                            border: InputBorder.none,
-                            contentPadding: EdgeInsets.symmetric(
-                              horizontal: 20,
-                              vertical: 10,
-                            ),
-                          ),
-                          maxLines: null,
-                          textCapitalization: TextCapitalization.sentences,
-                          onSubmitted: (_) => _sendMessage(),
-                        ),
-                      ),
+                    _chatTile(
+                      title: 'Vanguard AI Assistant', subtitle: 'Ask for safety help', isAi: true,
+                      onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const Chat(chatType: 'ai', friendId: 'vanguard_ai'))),
                     ),
-                    const SizedBox(width: 8),
-                    // File attach button before send button
-                    Container(
-                      decoration: BoxDecoration(
-                        color: Colors.grey[300],
-                        shape: BoxShape.circle,
-                      ),
-                      child: IconButton(
-                        icon: const Icon(
-                          Icons.attach_file,
-                          color: Colors.black87,
-                        ),
-                        onPressed: _isUploading ? null : _showImageSourceDialog,
-                        tooltip: 'Attach Image',
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    // Send button with app gradient colors
-                    Container(
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          colors: [Color(0xff250D57), Color(0xff38B6FF)],
-                        ),
-                        shape: BoxShape.circle,
-                      ),
-                      child: IconButton(
-                        icon: const Icon(Icons.send, color: Colors.white),
-                        onPressed: _sendMessage,
-                        tooltip: 'Send',
-                      ),
+                    const Padding(padding: EdgeInsets.symmetric(horizontal: 30, vertical: 5), child: Divider(thickness: 1, color: Color(0xffF1F2F6))),
+                    StreamBuilder<QuerySnapshot>(
+                      stream: _firestore.collection('users').doc(uid).collection('contacts').snapshots(),
+                      builder: (context, snap) {
+                        if (snap.connectionState == ConnectionState.waiting) {
+                          return const Center(child: Padding(padding: EdgeInsets.all(30), child: CircularProgressIndicator()));
+                        }
+                        final docs = snap.data?.docs ?? [];
+                        if (docs.isEmpty) return _emptyState();
+
+                        return Column(
+                          children: docs.map((doc) {
+                            final d = doc.data() as Map<String, dynamic>;
+                            final chatId = _buildChatId(doc.id);
+
+                            return StreamBuilder<DocumentSnapshot>(
+                              stream: _firestore.collection('users').doc(doc.id).snapshots(),
+                              builder: (context, userSnap) {
+                                String photoUrl = '';
+                                String name = d['name'] ?? 'User';
+                                if (userSnap.hasData && userSnap.data!.exists) {
+                                  final uData = userSnap.data!.data() as Map<String, dynamic>;
+                                  photoUrl = uData['photoUrl'] ?? '';
+                                  name = uData['name'] ?? name;
+                                }
+
+                                return StreamBuilder<DatabaseEvent>(
+                                  stream: _db.ref('chats/$chatId').onValue,
+                                  builder: (context, msgSnap) {
+                                    String lastMsg = 'Tap to message';
+                                    String time = '';
+                                    int unread = 0;
+
+                                    if (msgSnap.hasData && msgSnap.data!.snapshot.value != null) {
+                                      final chatData = msgSnap.data!.snapshot.value as Map<dynamic, dynamic>;
+                                      
+                                      // ── GET LAST MESSAGE ──
+                                      if (chatData['lastMessage'] != null) {
+                                        final m = chatData['lastMessage'] as Map<dynamic, dynamic>;
+                                        lastMsg = (m['text'] ?? '').toString();
+                                        if (lastMsg.length > 35) lastMsg = '${lastMsg.substring(0, 35)}...';
+                                        if (m['timestamp'] is int && m['timestamp'] > 0) {
+                                          time = DateFormat('hh:mm a').format(DateTime.fromMillisecondsSinceEpoch(m['timestamp']));
+                                        }
+                                      }
+
+                                      // ── GET EXACT UNREAD COUNT ──
+                                      final unreadMap = chatData['unreadCount'] as Map<dynamic, dynamic>?;
+                                      if (unreadMap != null && unreadMap[uid] != null) {
+                                        unread = int.tryParse(unreadMap[uid].toString()) ?? 0;
+                                      }
+                                    }
+
+                                    return _chatTile(
+                                      title: name,
+                                      subtitle: lastMsg,
+                                      time: time,
+                                      unread: unread,
+                                      photoUrl: photoUrl.isNotEmpty ? photoUrl : null,
+                                      onTap: () => Navigator.push(context, MaterialPageRoute(
+                                        builder: (_) => Chat(chatType: 'friend', friendName: name, friendId: doc.id),
+                                      )),
+                                    );
+                                  },
+                                );
+                              }
+                            );
+                          }).toList(),
+                        );
+                      },
                     ),
                   ],
                 ),
@@ -1736,272 +321,1538 @@ class _ChatState extends State<Chat> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildTypingIndicator() {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 12, left: 0, right: 0),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(16),
-            bottomLeft: Radius.circular(4),
-            bottomRight: Radius.circular(16),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.grey.withOpacity(0.2),
-              spreadRadius: 1,
-              blurRadius: 2,
-              offset: const Offset(0, 1),
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 8,
-              height: 8,
-              decoration: BoxDecoration(
-                color: Colors.grey[400],
-                shape: BoxShape.circle,
-              ),
-            ),
-            const SizedBox(width: 4),
-            Container(
-              width: 8,
-              height: 8,
-              decoration: BoxDecoration(
-                color: Colors.grey[400],
-                shape: BoxShape.circle,
-              ),
-            ),
-            const SizedBox(width: 4),
-            Container(
-              width: 8,
-              height: 8,
-              decoration: BoxDecoration(
-                color: Colors.grey[400],
-                shape: BoxShape.circle,
-              ),
-            ),
-          ],
-        ),
+      bottomNavigationBar: MyBottomBar(
+        selectedIndex: _selectedIndex,
+        onTap: (i) {
+          if (i == _selectedIndex) return;
+          Widget next;
+          if (i == 0) next = const HomePage();
+          else if (i == 1) return;
+          else if (i == 2) next = const Location();
+          else next = const Profile();
+          Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => next));
+        },
       ),
     );
   }
 
-  Widget _buildMessageBubble(ChatMessage message, int index, {String? messageId}) {
-    return GestureDetector(
-      onLongPress: () {
-        _showDeleteMessageDialog(index, messageId: messageId);
-      },
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        mainAxisAlignment: message.isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          if (!message.isMe) ...[
-            CircleAvatar(
-              radius: 16,
-              backgroundColor: Colors.grey[300],
-              backgroundImage: message.senderProfileUrl != null 
-                  ? NetworkImage(message.senderProfileUrl!) 
-                  : null,
-              child: message.senderProfileUrl == null 
-                  ? Text(message.senderName.isNotEmpty ? message.senderName[0].toUpperCase() : '?', 
-                      style: const TextStyle(fontSize: 12, color: Colors.black87)) 
-                  : null,
-            ),
-            const SizedBox(width: 8),
-          ],
-          Flexible(
-            child: Container(
-              margin: const EdgeInsets.only(bottom: 12),
-              constraints: BoxConstraints(
-                maxWidth: MediaQuery.of(context).size.width * 0.7,
-              ),
-              padding: const EdgeInsets.all(3), // Padding for border/shadow if needed
-              decoration: BoxDecoration(
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.08),
-                    spreadRadius: 0,
-                    blurRadius: 10,
-                    offset: const Offset(0, 4),
-                  ),
-                ],
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.only(
-                  topLeft: const Radius.circular(20),
-                  topRight: const Radius.circular(20),
-                  bottomLeft: Radius.circular(message.isMe ? 20 : 4),
-                  bottomRight: Radius.circular(message.isMe ? 4 : 20),
-                ),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  decoration: BoxDecoration(
-                    gradient: message.isMe 
-                        ? const LinearGradient(
-                            colors: [Color(0xff250D57), Color(0xff38B6FF)],
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                          )
-                        : null,
-                    color: message.isMe ? null : Colors.white,
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      if (!message.isMe)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 4),
-                          child: Text(
-                            message.senderName,
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
-                              color: message.senderId == 'ai'
-                                  ? const Color(0xff250D57)
-                                  : Colors.grey[600],
-                            ),
-                          ),
-                        ),
-                      if (message.imageUrl != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 8.0),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
-                            child: Image.network(
-                              message.imageUrl!,
-                              fit: BoxFit.cover,
-                              errorBuilder: (context, error, stackTrace) => 
-                                  const Icon(Icons.broken_image, size: 50, color: Colors.grey),
-                              loadingBuilder: (context, child, loadingProgress) {
-                                if (loadingProgress == null) return child;
-                                return const Center(child: CircularProgressIndicator());
-                              },
-                            ),
-                          ),
-                        ),
-                      if (message.text.isNotEmpty)
-                        Text(
-                          message.text,
-                          style: TextStyle(
-                            fontSize: 15, 
-                            color: message.isMe ? Colors.white : Colors.black87,
-                            height: 1.3,
-                          ),
-                        ),
-                      const SizedBox(height: 6),
-                      Align(
-                        alignment: Alignment.bottomRight,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              _formatTimestamp(message.timestamp),
-                              style: TextStyle(
-                                fontSize: 10, 
-                                color: message.isMe ? Colors.white.withValues(alpha: 0.7) : Colors.grey[500],
-                              ),
-                            ),
-                            if (message.isMe) ...[
-                              const SizedBox(width: 4),
-                              Icon(
-                                Icons.done_all,
-                                size: 14,
-                                color: message.isRead ? const Color(0xff38B6FF) : Colors.white70,
-                              ),
-                            ],
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  Widget _addStory() => Padding(
+    padding: const EdgeInsets.only(right: 20),
+    child: InkWell(
+      onTap: _pickAndUploadStatus,
+      child: Column(children: [
+        Container(
+          height: 60, width: 60, 
+          decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), shape: BoxShape.circle), 
+          child: _isUploadingStatus ? const Padding(padding: EdgeInsets.all(15), child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Icon(Icons.add, color: Colors.white, size: 30)
+        ),
+        const SizedBox(height: 8),
+        const Text('Add Status', style: TextStyle(color: Colors.white70, fontSize: 11)),
+      ]),
+    ),
+  );
 
-  void _showDeleteMessageDialog(int index, {String? messageId}) {
-    showDialog(
+  bool _isUploadingStatus = false;
+  Future<void> _pickAndUploadStatus() async {
+    final user = _auth.currentUser;
+    if (user == null) return;
+
+    final source = await showModalBottomSheet<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete Message'),
-        content: const Text('Are you sure you want to delete this message?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () async {
-              if (widget.chatType == 'ai') {
-                setState(() {
-                  _messages.removeAt(index);
-                });
-                await _saveLocalMessages();
-              } else if (messageId != null) {
-                final chatId = _getChatId();
-                await FirebaseFirestore.instance
-                    .collection('chats')
-                    .doc(chatId)
-                    .collection('messages')
-                    .doc(messageId)
-                    .delete();
-              }
-              if (mounted) Navigator.pop(context);
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Message deleted'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
-              }
-            },
-            child: const Text('Delete', style: TextStyle(color: Colors.red)),
-          ),
-        ],
-      ),
+      backgroundColor: const Color(0xff250D57),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => Column(mainAxisSize: MainAxisSize.min, children: [
+        const SizedBox(height: 10),
+        ListTile(leading: const Icon(Icons.image, color: Colors.white), title: const Text('Pick Image', style: TextStyle(color: Colors.white)), onTap: () => Navigator.pop(context, 'image')),
+        ListTile(leading: const Icon(Icons.video_collection, color: Colors.white), title: const Text('Pick Video (max 3MB)', style: TextStyle(color: Colors.white)), onTap: () => Navigator.pop(context, 'video')),
+        const SizedBox(height: 10),
+      ]),
     );
-  }
 
-  String _formatTimestamp(DateTime timestamp) {
-    final now = DateTime.now();
-    final difference = now.difference(timestamp);
+    if (source == null) return;
 
-    if (difference.inDays == 0) {
-      // Today - show time
-      final hour = timestamp.hour;
-      final minute = timestamp.minute.toString().padLeft(2, '0');
-      final period = hour >= 12 ? 'PM' : 'AM';
-      final displayHour = hour > 12 ? hour - 12 : (hour == 0 ? 12 : hour);
-      return '$displayHour:$minute $period';
-    } else if (difference.inDays == 1) {
-      // Yesterday
-      final hour = timestamp.hour;
-      final minute = timestamp.minute.toString().padLeft(2, '0');
-      final period = hour >= 12 ? 'PM' : 'AM';
-      final displayHour = hour > 12 ? hour - 12 : (hour == 0 ? 12 : hour);
-      return 'Yesterday $displayHour:$minute $period';
-    } else {
-      // Older
-      return '${timestamp.day}/${timestamp.month}/${timestamp.year}';
+    final picked = (source == 'image')
+        ? await _imagePicker.pickImage(source: ImageSource.gallery, imageQuality: 60)
+        : await _imagePicker.pickVideo(source: ImageSource.gallery, maxDuration: const Duration(seconds: 30));
+
+    if (picked == null) return;
+
+    if (source == 'video') {
+      final size = await File(picked.path).length();
+      if (size > 3 * 1024 * 1024) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Video must be less than 3MB')));
+        return;
+      }
+    }
+
+    setState(() => _isUploadingStatus = true);
+    try {
+      final link = await CloudinaryService.uploadFile(File(picked.path));
+      if (link != null) {
+        // ── APPEND a new status object to the 'statuses' array ──
+        // This keeps all previous statuses intact.
+        await _firestore.collection('users').doc(user.uid).set({
+          'statuses': FieldValue.arrayUnion([
+            {
+              'url': link,
+              'type': source,
+              'time': Timestamp.now(),    // client timestamp — server timestamp not supported in arrayUnion
+              'viewers': {},
+            }
+          ]),
+        }, SetOptions(merge: true));
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Status added! ✅')));
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+    } finally {
+      if (mounted) setState(() => _isUploadingStatus = false);
     }
   }
 
-  // Legacy sendPushNotification removed in favor of NotificationService
+  // ── Reads the new 'statuses' array and shows the bubble ──
+  Widget _recentUser(String name, String? photoUrl, {List? statuses, String? ownerId, Map<String, dynamic>? userData}) {
+    final myUid = _auth.currentUser?.uid;
+    final bool isMe = ownerId == myUid;
+
+    // Filter to only statuses less than 24h old, and attach actual viewers!
+    final now = DateTime.now();
+    List<Map<String, dynamic>> activeStatuses = [];
+    
+    if (statuses != null) {
+      for (int i = 0; i < statuses.length; i++) {
+        final s = statuses[i] as Map;
+        final t = s['time'];
+        if (t != null) {
+          final dt = (t is Timestamp) ? t.toDate() : DateTime.fromMillisecondsSinceEpoch(t as int);
+          if (now.difference(dt).inHours < 24) {
+            final sCopy = Map<String, dynamic>.from(s);
+            sCopy['_origIndex'] = i;
+            sCopy['_viewers'] = userData?['statusViewedBy_$i'] as Map? ?? {};
+            activeStatuses.add(sCopy);
+          }
+        }
+      }
+    }
+
+    final bool hasActiveStatus = activeStatuses.isNotEmpty;
+
+    // Count how many of the active statuses I have NOT seen
+    int unseenCount = 0;
+    if (myUid != null) {
+      for (final s in activeStatuses) {
+        final viewers = s['_viewers'] as Map? ?? {};
+        if (!viewers.containsKey(myUid)) unseenCount++;
+      }
+    }
+    final bool isSeen = hasActiveStatus && unseenCount == 0;
+
+    // Total views across all MY active statuses (for the owner badge)
+    int totalViews = 0;
+    if (isMe) {
+      // Find the status with the MOST views and show that count, OR sum them.
+      // Usually WhatsApp shows count for the active statuses, maybe we show aggregate
+      final Set<String> uniqueViewers = {};
+      for (final s in activeStatuses) {
+        final viewers = s['_viewers'] as Map? ?? {};
+        uniqueViewers.addAll(viewers.keys.cast<String>());
+      }
+      totalViews = uniqueViewers.length;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(right: 20),
+      child: Column(children: [
+        GestureDetector(
+          onTap: () {
+            if (hasActiveStatus) {
+              _showMultiStatusView(activeStatuses, ownerId!, isMe);
+            } else if (photoUrl != null) {
+              _showFullImage(context, photoUrl);
+            }
+          },
+          child: Stack(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(2),
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color: hasActiveStatus
+                        ? (isMe
+                            ? Colors.greenAccent
+                            : (isSeen ? Colors.grey.withOpacity(0.5) : const Color(0xff38B6FF)))
+                        : Colors.transparent,
+                    width: 2.5,
+                  ),
+                  shape: BoxShape.circle,
+                ),
+                child: CircleAvatar(
+                  radius: 28,
+                  backgroundColor: const Color(0xff38B6FF).withOpacity(0.1),
+                  backgroundImage: photoUrl != null ? NetworkImage(photoUrl) : null,
+                  child: photoUrl == null ? const Icon(Icons.person, color: Colors.white, size: 20) : null,
+                ),
+              ),
+              // Status count badge for my own bubble
+              if (isMe && hasActiveStatus && totalViews > 0)
+                Positioned(
+                  bottom: 0, right: 0,
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: const BoxDecoration(color: Colors.green, shape: BoxShape.circle),
+                    child: Text('$totalViews', style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              // Unseen indicator for other users
+              if (!isMe && hasActiveStatus && unseenCount > 0)
+                Positioned(
+                  top: 0, right: 0,
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: const BoxDecoration(color: Color(0xff38B6FF), shape: BoxShape.circle),
+                    child: Text('$unseenCount', style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          isMe ? 'My Status' : name.split(' ').first,
+          style: TextStyle(
+            color: hasActiveStatus ? Colors.white : Colors.white70,
+            fontSize: 11,
+            fontWeight: hasActiveStatus ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
+      ]),
+    );
+  }
+
+  // ── Shows all statuses of a single viewer as a bottom sheet ──
+  void _showViewersList(List activeStatuses) {
+    // Aggregate all unique viewers across all active statuses
+    final Map<String, dynamic> allViewers = {};
+    for (final s in activeStatuses) {
+      final viewers = s['_viewers'] as Map? ?? {};
+      viewers.forEach((uid, time) {
+        // Keep the latest time they viewed anything
+        if (!allViewers.containsKey(uid.toString())) {
+          allViewers[uid.toString()] = time;
+        } else {
+          final existing = allViewers[uid.toString()];
+          if (time is Timestamp && existing is Timestamp && time.compareTo(existing) > 0) {
+            allViewers[uid.toString()] = time;
+          }
+        }
+      });
+    }
+
+    if (allViewers.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No views yet.')));
+      return;
+    }
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xff250D57),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.only(topLeft: Radius.circular(20), topRight: Radius.circular(20))),
+      builder: (_) => Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(15.0),
+            child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              Text('Viewers (${allViewers.length})', style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              Text('${activeStatuses.length} status${activeStatuses.length > 1 ? "es" : ""}', style: const TextStyle(color: Colors.white60, fontSize: 13)),
+            ]),
+          ),
+          const Divider(color: Colors.white24),
+          Expanded(
+            child: ListView(
+              children: allViewers.keys.map((uid) => StreamBuilder<DocumentSnapshot>(
+                stream: _firestore.collection('users').doc(uid).snapshots(),
+                builder: (_, snap) {
+                  final data = snap.data?.data() as Map<String, dynamic>?;
+                  final name = data?['name'] ?? 'Unknown';
+                  final photo = data?['photoUrl'];
+                  final timeRaw = allViewers[uid];
+                  String timeStr = 'Recently';
+                  if (timeRaw is Timestamp) timeStr = DateFormat('hh:mm a').format(timeRaw.toDate());
+                  return ListTile(
+                    leading: CircleAvatar(backgroundImage: photo != null ? NetworkImage(photo) : null, child: photo == null ? const Icon(Icons.person) : null),
+                    title: Text(name, style: const TextStyle(color: Colors.white)),
+                    trailing: Text(timeStr, style: const TextStyle(color: Colors.white60, fontSize: 12)),
+                  );
+                },
+              )).toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── NEW: Cycles through ALL statuses of a user like WhatsApp ──
+  void _showMultiStatusView(List activeStatuses, String ownerId, bool isMe) {
+    final curUid = _auth.currentUser?.uid;
+    if (curUid == null) return;
+
+    showDialog(
+      context: context,
+      builder: (_) => _MultiStatusPlayerDialog(
+        statuses: activeStatuses,
+        ownerId: ownerId,
+        curUid: curUid,
+        isMe: isMe,
+        firestore: _firestore,
+      ),
+    );
+  }
+
+  void _showFullImage(BuildContext context, String url) {
+    showDialog(
+      context: context,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ClipRRect(borderRadius: BorderRadius.circular(15), child: Image.network(url, fit: BoxFit.contain)),
+          const SizedBox(height: 10),
+          IconButton(icon: const Icon(Icons.close, color: Colors.white, size: 30), onPressed: () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+
+  Widget _chatTile({required String title, required String subtitle, bool isAi = false, String? time, int unread = 0, String? photoUrl, required VoidCallback onTap}) {
+    return ListTile(
+      onTap: onTap,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 25, vertical: 8),
+      leading: Stack(children: [
+      GestureDetector(
+        onTap: () { if (photoUrl != null) _showFullImage(context, photoUrl); },
+        child: Container(
+          height: 60, width: 60,
+          decoration: BoxDecoration(
+            gradient: isAi ? const LinearGradient(colors: [Color(0xff250D57), Color(0xff38B6FF)]) : null,
+            color: isAi ? null : const Color(0xffF0F2F5),
+            borderRadius: BorderRadius.circular(20)),
+          child: photoUrl != null 
+            ? ClipRRect(borderRadius: BorderRadius.circular(20), child: Image.network(photoUrl, fit: BoxFit.cover, errorBuilder: (_, __, ___) => Icon(isAi ? Icons.auto_awesome : Icons.person, color: isAi ? Colors.white : const Color(0xff250D57), size: 30)))
+            : Icon(isAi ? Icons.auto_awesome : Icons.person, color: isAi ? Colors.white : const Color(0xff250D57), size: 30)),
+      ),
+      if (!isAi)
+          Positioned(bottom: 2, right: 2, child: Container(height: 14, width: 14, decoration: BoxDecoration(color: Colors.green, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)))),
+      ]),
+      title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17, color: Color(0xff250D57))),
+      subtitle: Text(subtitle, style: TextStyle(color: unread > 0 ? const Color(0xff250D57) : Colors.grey, fontSize: 14, fontWeight: unread > 0 ? FontWeight.w600 : FontWeight.normal)),
+      trailing: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.end, children: [
+        if (time != null && time.isNotEmpty) Text(time, style: TextStyle(color: unread > 0 ? const Color(0xff38B6FF) : Colors.grey, fontSize: 12)),
+        if (unread > 0)
+          Container(margin: const EdgeInsets.only(top: 6), padding: const EdgeInsets.all(6), decoration: const BoxDecoration(color: Color(0xff38B6FF), shape: BoxShape.circle),
+            child: Text('$unread', style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold))),
+      ]),
+    );
+  }
+
+  Widget _emptyState() => Padding(
+    padding: const EdgeInsets.only(top: 50),
+    child: Column(children: [
+      Icon(Icons.chat_bubble_outline, size: 80, color: Colors.grey[300]),
+      const SizedBox(height: 20),
+      const Text('Add contacts on Home to chat', style: TextStyle(color: Colors.grey, fontSize: 14)),
+    ]),
+  );
+}
+
+// ════════════════════════════════════════════════════════════════
+//  CHAT SCREEN  — INSTANT loading via onChildAdded
+// ════════════════════════════════════════════════════════════════
+class Chat extends StatefulWidget {
+  final String chatType;
+  final String? friendName;
+  final String friendId;
+  const Chat({super.key, required this.chatType, this.friendName, required this.friendId});
+  @override
+  State<Chat> createState() => _ChatState();
+}
+
+class _ChatState extends State<Chat> with WidgetsBindingObserver {
+  final _msgCtrl = TextEditingController();
+  final _scrollCtrl = ScrollController();
+  final _auth = FirebaseAuth.instance;
+
+  late final FirebaseDatabase _db;
+  late final DatabaseReference _msgsRef;
+  final _firestore = FirebaseFirestore.instance;
+
+  // Messages stored in a map for O(1) lookup on update/remove
+  final Map<String, ChatMessage> _messageMap = {};
+  List<ChatMessage> _sortedMessages = [];
+
+  StreamSubscription? _addSub;
+  StreamSubscription? _changeSub;
+  StreamSubscription? _removeSub;
+  StreamSubscription? _typingSub;
+
+  bool _aiTyping = false;
+  bool _friendTyping = false;
+  bool _friendOnline = false;
+  int? _lastSeen;
+  bool _isUploadingImage = false;
+  late String _chatId;
+  late String _myId;
+  Timer? _typingTimer;
+  final _imagePicker = ImagePicker();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _db = FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL: 'https://emergency-alert-9cff6-default-rtdb.asia-southeast1.firebasedatabase.app',
+    );
+
+    _myId = _auth.currentUser?.uid ?? 'guest';
+    PresenceService.setOnline(_myId);
+
+    if (widget.chatType == 'ai') {
+      _chatId = 'ai_$_myId';
+    } else {
+      final ids = [_myId, widget.friendId]..sort();
+      _chatId = ids.join('_');
+    }
+
+    _msgsRef = _db.ref('chats/$_chatId/messages');
+
+    // Keep data synced for instant offline loading
+    _msgsRef.keepSynced(true);
+    
+    // ── CLEAR UNREAD COUNT FOR ME ──
+    _db.ref('chats/$_chatId/unreadCount/$_myId').set(0);
+
+    _listenMessages();
+    _listenTyping();
+    _listenPresence();
+  }
+
+  // ══════════════════════════════════════════
+  //  INSTANT MESSAGE LOADING — onChildAdded
+  //  Messages appear ONE BY ONE as they arrive
+  //  from local cache (instant) or network.
+  // ══════════════════════════════════════════
+  void _listenMessages() {
+    // onChildAdded fires ONCE for each existing child + new ones
+    _addSub = _msgsRef.orderByChild('timestamp').onChildAdded.listen((event) {
+      if (!mounted) return;
+      final key = event.snapshot.key;
+      final val = event.snapshot.value;
+      if (key == null || val == null || val is! Map) return;
+
+      final msg = ChatMessage.fromMap(key, val, _myId);
+      _messageMap[key] = msg;
+      _rebuildSorted();
+
+      // Auto-mark as seen
+      if (!msg.isMe && msg.status != MessageStatus.seen) {
+        _msgsRef.child('$key/status').set('seen');
+        // Also update lastMessage node so selection screen/notifications know it's seen
+        _db.ref('chats/$_chatId/lastMessage/status').set('seen');
+      }
+    }, onError: (e) => debugPrint('onChildAdded error: $e'));
+
+    // onChildChanged — read receipt updates etc.
+    _changeSub = _msgsRef.onChildChanged.listen((event) {
+      if (!mounted) return;
+      final key = event.snapshot.key;
+      final val = event.snapshot.value;
+      if (key == null || val == null || val is! Map) return;
+
+      _messageMap[key] = ChatMessage.fromMap(key, val, _myId);
+      _rebuildSorted();
+    });
+
+    // onChildRemoved — message deleted
+    _removeSub = _msgsRef.onChildRemoved.listen((event) {
+      if (!mounted) return;
+      final key = event.snapshot.key;
+      if (key == null) return;
+      _messageMap.remove(key);
+      _rebuildSorted();
+    });
+  }
+
+  void _rebuildSorted() {
+    final list = _messageMap.values.toList();
+    list.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    setState(() => _sortedMessages = list);
+    _scroll();
+  }
+
+  // ── LISTEN TYPING ──
+  void _listenTyping() {
+    if (widget.chatType == 'ai') return;
+    _typingSub = _db.ref('chats/$_chatId/typing/${widget.friendId}').onValue.listen((event) {
+      if (!mounted) return;
+      setState(() => _friendTyping = event.snapshot.value == true);
+    });
+  }
+
+  // ── LISTEN PRESENCE ──
+  void _listenPresence() {
+    if (widget.chatType == 'ai') {
+      setState(() => _friendOnline = true);
+      return;
+    }
+    PresenceService.watchPresence(widget.friendId).listen((event) {
+      if (!mounted) return;
+      final val = event.snapshot.value;
+      if (val is Map) {
+        setState(() {
+          _friendOnline = val['online'] == true;
+          _lastSeen = val['lastSeen'] as int?;
+        });
+      }
+    });
+  }
+
+  void _setTyping(bool typing) {
+    _db.ref('chats/$_chatId/typing/$_myId').set(typing);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) PresenceService.setOnline(_myId);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _addSub?.cancel();
+    _changeSub?.cancel();
+    _removeSub?.cancel();
+    _typingSub?.cancel();
+    _typingTimer?.cancel();
+    _setTyping(false);
+    _msgCtrl.dispose();
+    _scrollCtrl.dispose();
+    super.dispose();
+  }
+
+  // ── SEND ──
+  Future<void> _send() async {
+    final text = _msgCtrl.text.trim();
+    if (text.isEmpty) return;
+    _msgCtrl.clear();
+    _setTyping(false);
+
+    final user = _auth.currentUser;
+    final name = user?.displayName ?? 'Me';
+
+    try {
+      final msgData = {
+        'text': text,
+        'senderId': _myId,
+        'senderName': name,
+        'timestamp': ServerValue.timestamp,
+        'status': _friendOnline ? 'delivered' : 'sent',
+      };
+      await _msgsRef.push().set(msgData);
+      await _db.ref('chats/$_chatId/lastMessage').set(msgData);
+
+      // ── INCREMENT UNREAD COUNT FOR FRIEND ──
+      if (widget.chatType != 'ai') {
+        _db.ref('chats/$_chatId/unreadCount/${widget.friendId}').set(ServerValue.increment(1));
+      }
+
+      if (widget.chatType == 'ai') {
+        _aiRespond(text);
+      } else {
+        // 🔔 Send push notification to receiver (works even when app is closed)
+        FcmService.sendNotification(
+          receiverUid: widget.friendId,
+          title: name,
+          body: text,
+          data: {'chatId': _chatId},
+        );
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Send failed: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  // ── DELETE MESSAGE ──
+  Future<void> _deleteMessage(String msgId) async {
+    try {
+      await _msgsRef.child(msgId).remove();
+
+      // Update lastMessage
+      if (_sortedMessages.isNotEmpty) {
+        final remaining = _sortedMessages.where((m) => m.id != msgId).toList();
+        if (remaining.isNotEmpty) {
+          final last = remaining.last;
+          await _db.ref('chats/$_chatId/lastMessage').set({
+            'text': last.text, 'senderId': last.senderId, 'senderName': last.senderName,
+            'timestamp': last.timestamp, 'status': last.status.name,
+          });
+        } else {
+          await _db.ref('chats/$_chatId/lastMessage').remove();
+        }
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Delete failed: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  // ── AI ──
+  void _aiRespond(String query) {
+    setState(() => _aiTyping = true);
+    Future.delayed(const Duration(milliseconds: 1200), () async {
+      if (!mounted) return;
+      String reply;
+      final q = query.toLowerCase();
+      if (q.contains('help') || q.contains('emergency')) {
+        reply = "🚨 Stay calm. If it's an emergency, press the alert button on Home.";
+      } else if (q.contains('hello') || q.contains('hi') || q.contains('hey')) {
+        reply = "Hello! 👋 I'm Vanguard AI. How can I keep you safe today?";
+      } else if (q.contains('location') || q.contains('where')) {
+        reply = "📍 Share your live location from the Location tab.";
+      } else if (q.contains('safe')) {
+        reply = "✅ Great! You can reach contacts instantly from Home.";
+      } else {
+        reply = "I'm monitoring your safety.\n• Type 'help' for emergency\n• Type 'location' for sharing\n• Type 'safe' for status";
+      }
+
+      final aiMsg = {
+        'text': reply, 'senderId': 'vanguard_ai', 'senderName': 'Vanguard AI',
+        'timestamp': ServerValue.timestamp, 'status': 'seen',
+      };
+      await _msgsRef.push().set(aiMsg);
+      await _db.ref('chats/$_chatId/lastMessage').set(aiMsg);
+      if (mounted) setState(() => _aiTyping = false);
+    });
+  }
+
+  void _scroll() {
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (_scrollCtrl.hasClients) {
+        _scrollCtrl.animateTo(0, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+      }
+    });
+  }
+
+  // ── BUILD ──
+  @override
+  Widget build(BuildContext context) {
+    const theme = Color(0xff250D57);
+    const accent = Color(0xff38B6FF);
+    final isTyping = widget.chatType == 'ai' ? _aiTyping : _friendTyping;
+
+    return Scaffold(
+      backgroundColor: const Color(0xffF5F7FB),
+      appBar: AppBar(
+        backgroundColor: Colors.white, elevation: 1,
+        leading: IconButton(icon: const Icon(Icons.arrow_back_ios, color: theme), onPressed: () => Navigator.pop(context)),
+        title: Row(children: [
+          StreamBuilder<DocumentSnapshot>(
+            stream: _firestore.collection('users').doc(widget.friendId).snapshots(),
+            builder: (context, snap) {
+              String? pUrl;
+              if (snap.hasData && snap.data!.exists) {
+                pUrl = (snap.data!.data() as Map<String, dynamic>)['photoUrl'];
+              }
+              return Stack(children: [
+                GestureDetector(
+                  onTap: () { if (pUrl != null) _showFullImage(context, pUrl); },
+                  child: CircleAvatar(
+                    backgroundColor: accent.withOpacity(0.1),
+                    backgroundImage: pUrl != null ? NetworkImage(pUrl) : null,
+                    child: pUrl == null ? Icon(widget.chatType == 'ai' ? Icons.auto_awesome : Icons.person, color: theme) : null,
+                  ),
+                ),
+                Positioned(bottom: 0, right: 0, child: Container(height: 12, width: 12, decoration: BoxDecoration(color: _friendOnline ? Colors.green : Colors.grey, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)))),
+              ]);
+            }
+          ),
+          const SizedBox(width: 12),
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(widget.friendName ?? 'Vanguard AI', style: const TextStyle(color: theme, fontSize: 16, fontWeight: FontWeight.bold)),
+            if (widget.chatType != 'ai')
+              Text(
+                isTyping ? 'typing...' : (_friendOnline ? 'Online' : PresenceService.formatLastSeen(_lastSeen)),
+                style: TextStyle(color: isTyping ? accent : (_friendOnline ? Colors.green : Colors.grey), fontSize: 11, fontWeight: FontWeight.w600),
+              ),
+          ]),
+        ]),
+        actions: [
+          IconButton(icon: const Icon(Icons.call, color: theme, size: 22), onPressed: () {}),
+          IconButton(icon: const Icon(Icons.videocam, color: theme, size: 22), onPressed: () {}),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: _sortedMessages.isEmpty
+                ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.lock_outline, size: 40, color: Colors.grey[300]),
+                    const SizedBox(height: 12),
+                    Text('Messages are end-to-end secured\nSay Hi! 👋', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey[400], fontSize: 14)),
+                  ]))
+                : ListView.builder(
+                    controller: _scrollCtrl,
+                    reverse: true,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                    itemCount: _sortedMessages.length,
+                    itemBuilder: (_, i) => _bubble(_sortedMessages[_sortedMessages.length - 1 - i]),
+                  ),
+          ),
+          if (isTyping)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
+              child: Row(children: [
+                _typingDots(),
+                const SizedBox(width: 8),
+                Text('${widget.friendName ?? "AI"} is typing...', style: const TextStyle(fontStyle: FontStyle.italic, color: Colors.grey, fontSize: 12)),
+              ]),
+            ),
+          _input(),
+        ],
+      ),
+    );
+  }
+
+  Widget _typingDots() => SizedBox(
+    width: 30, height: 14,
+    child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: List.generate(3, (i) =>
+      TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0, end: 1),
+        duration: Duration(milliseconds: 400 + i * 200),
+        builder: (_, v, __) => Opacity(opacity: v, child: Container(width: 6, height: 6, decoration: const BoxDecoration(color: Color(0xff38B6FF), shape: BoxShape.circle))),
+      ),
+    )),
+  );
+
+  Widget _bubble(ChatMessage msg) {
+    final isMe = msg.isMe;
+    const theme = Color(0xff250D57);
+    const accent = Color(0xff38B6FF);
+
+    Widget content;
+    if (msg.isLocation) {
+      content = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Container(
+          height: 160, width: 230,
+          decoration: BoxDecoration(
+            color: isMe ? Colors.white.withOpacity(0.1) : Colors.grey[100],
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Stack(alignment: Alignment.center, children: [
+            Positioned.fill(child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: Opacity(opacity: 0.5, child: Icon(Icons.map, size: 80, color: isMe ? Colors.white24 : Colors.grey[300])),
+            )),
+            StreamBuilder<DocumentSnapshot>(
+              stream: _firestore.collection('users').doc(msg.senderId).snapshots(),
+              builder: (ctx, snap) {
+                String? pUrl;
+                if (snap.hasData && snap.data!.exists) pUrl = (snap.data!.data() as Map<String, dynamic>)['photoUrl'];
+                return Container(
+                  padding: const EdgeInsets.all(2),
+                  decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+                  child: CircleAvatar(
+                    radius: 24,
+                    backgroundColor: accent.withOpacity(0.1),
+                    backgroundImage: pUrl != null ? NetworkImage(pUrl) : null,
+                    child: pUrl == null ? Text(msg.senderName[0].toUpperCase(), style: const TextStyle(fontWeight: FontWeight.bold, color: theme)) : null,
+                  ),
+                );
+              }
+            ),
+            if (msg.alertType != null)
+              Positioned(top: 8, left: 8, child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(color: Colors.redAccent, borderRadius: BorderRadius.circular(20)),
+                child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                  CircleAvatar(radius: 3, backgroundColor: Colors.white),
+                  SizedBox(width: 4),
+                  Text('LIVE', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+                ]),
+              )),
+          ]),
+        ),
+        const SizedBox(height: 8),
+        Text(msg.text, style: TextStyle(color: isMe ? Colors.white : theme, fontSize: 14, fontWeight: FontWeight.bold, height: 1.2)),
+        const SizedBox(height: 5),
+        const Divider(color: Colors.black12, height: 1),
+        InkWell(
+          onTap: () {
+            Navigator.push(context, MaterialPageRoute(builder: (_) => Location(
+              targetLat: msg.lat,
+              targetLng: msg.lng,
+              targetName: msg.senderName,
+            )));
+          },
+          child: const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              Icon(Icons.location_on, color: Color(0xff4CAF50), size: 16),
+              SizedBox(width: 4),
+              Text('View live location', style: TextStyle(color: Color(0xff4CAF50), fontWeight: FontWeight.bold, fontSize: 14)),
+            ]),
+          ),
+        ),
+      ]);
+    } else if (msg.isImage) {
+      content = Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+        GestureDetector(
+          onTap: () => _showFullImage(context, msg.imageUrl!),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: Image.network(
+              msg.imageUrl!,
+              width: 200, height: 200, fit: BoxFit.cover,
+              loadingBuilder: (_, child, prog) => prog == null ? child : const SizedBox(width: 200, height: 200, child: Center(child: CircularProgressIndicator())),
+              errorBuilder: (_, __, ___) => Container(width: 200, height: 100, color: Colors.grey[200], child: const Icon(Icons.broken_image)),
+            ),
+          ),
+        ),
+        if (msg.text.isNotEmpty && msg.text != '📷 Photo')
+          Padding(padding: const EdgeInsets.only(top: 6), child: Text(msg.text, style: TextStyle(color: isMe ? Colors.white : theme, fontSize: 15))),
+      ]);
+    } else {
+      content = Text(msg.text, style: TextStyle(color: isMe ? Colors.white : theme, fontSize: 15, height: 1.4));
+    }
+
+    return GestureDetector(
+      onLongPress: () {
+        showModalBottomSheet(
+          context: context,
+          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+          builder: (_) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const SizedBox(height: 8),
+            Container(height: 4, width: 40, decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+            const SizedBox(height: 12),
+            if (isMe) ListTile(leading: const Icon(Icons.delete_outline, color: Colors.redAccent), title: const Text('Delete Message'), onTap: () { Navigator.pop(context); _deleteMessage(msg.id); }),
+            ListTile(leading: const Icon(Icons.copy, color: Colors.grey), title: const Text('Copy Text'), onTap: () { Navigator.pop(context); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Copied!'))); }),
+            ListTile(leading: const Icon(Icons.reply, color: Colors.grey), title: const Text('Reply'), onTap: () => Navigator.pop(context)),
+            const SizedBox(height: 8),
+          ])),
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Align(
+          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+          child: Container(
+            constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            decoration: BoxDecoration(
+              color: isMe ? theme : Colors.white,
+              borderRadius: BorderRadius.only(
+                topLeft: const Radius.circular(18), topRight: const Radius.circular(18),
+                bottomLeft: isMe ? const Radius.circular(18) : Radius.zero,
+                bottomRight: isMe ? Radius.zero : const Radius.circular(18),
+              ),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 4, offset: const Offset(0, 2))],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                content,
+                const SizedBox(height: 4),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  Text(msg.formattedTime, style: TextStyle(color: isMe ? Colors.white54 : Colors.grey, fontSize: 10)),
+                  if (isMe) ...[
+                    const SizedBox(width: 4),
+                    Icon(
+                      msg.status == MessageStatus.seen ? Icons.done_all : (msg.status == MessageStatus.delivered ? Icons.done_all : Icons.done),
+                      size: 14, 
+                      color: msg.status == MessageStatus.seen ? accent : (msg.status == MessageStatus.delivered ? Colors.white70 : Colors.white38),
+                    ),
+                  ],
+                ]),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── PICK & SEND IMAGE ──
+  Future<void> _pickAndSendImage() async {
+    final source = await showModalBottomSheet<String>(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SizedBox(height: 8),
+          Container(height: 4, width: 40, decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+          const SizedBox(height: 12),
+          ListTile(leading: const Icon(Icons.camera_alt, color: Color(0xff38B6FF)), title: const Text('Camera'), onTap: () => Navigator.pop(context, 'camera')),
+          ListTile(leading: const Icon(Icons.photo_library, color: Color(0xff250D57)), title: const Text('Gallery'), onTap: () => Navigator.pop(context, 'gallery')),
+          ListTile(leading: const Icon(Icons.videocam, color: Colors.redAccent), title: const Text('Video (Max 3MB)'), onTap: () => Navigator.pop(context, 'video')),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+
+    if (source == null) return;
+    if (source == 'video') { _pickAndSendVideo(); return; }
+
+    final picked = await _imagePicker.pickImage(source: source == 'camera' ? ImageSource.camera : ImageSource.gallery, imageQuality: 70, maxWidth: 1024);
+    if (picked == null) return;
+
+    final file = File(picked.path);
+    final sizeInBytes = await file.length();
+    final sizeInMb = sizeInBytes / (1024 * 1024);
+
+    if (sizeInMb > 1.0) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Image size must be less than 1MB'), backgroundColor: Colors.red));
+      return;
+    }
+
+    setState(() => _isUploadingImage = true);
+
+    try {
+      final file = File(picked.path);
+      // Professional Centralized Upload
+      final link = await CloudinaryService.uploadFile(file);
+
+      if (link == null) {
+        final msg = CloudinaryService.lastErrorMessage ?? 'Image upload failed. Please try again.';
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(msg), backgroundColor: Colors.red),
+          );
+        }
+        return;
+      }
+
+      final user = _auth.currentUser;
+      final senderName = user?.displayName ?? 'Me';
+      final msgData = {
+        'text': '📷 Photo',
+        'imageUrl': link,
+        'senderId': _myId,
+        'senderName': senderName,
+        'timestamp': ServerValue.timestamp,
+        'status': 'sent',
+      };
+      await _msgsRef.push().set(msgData);
+      await _db.ref('chats/$_chatId/lastMessage').set(msgData);
+
+      // ── INCREMENT UNREAD COUNT FOR FRIEND ──
+      _db.ref('chats/$_chatId/unreadCount/${widget.friendId}').set(ServerValue.increment(1));
+
+      // 🔔 Notify receiver about the photo
+      FcmService.sendNotification(
+        receiverUid: widget.friendId,
+        title: senderName,
+        body: '📷 Sent you a photo',
+        data: {'chatId': _chatId},
+      );
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e'), backgroundColor: Colors.red));
+    } finally {
+      if (mounted) setState(() => _isUploadingImage = false);
+    }
+  }
+
+  Widget _input() {
+    const accent = Color(0xff38B6FF);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(color: Colors.white, boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, -5))]),
+      child: SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_isUploadingImage)
+              const LinearProgressIndicator(color: accent, minHeight: 3),
+            Row(children: [
+              IconButton(
+                icon: const Icon(Icons.add_circle_outline, color: Colors.grey),
+                onPressed: _isUploadingImage ? null : _pickAndSendImage,
+              ),
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 15),
+                  decoration: BoxDecoration(color: const Color(0xffF0F2F5), borderRadius: BorderRadius.circular(25)),
+                  child: TextField(
+                    controller: _msgCtrl,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _send(),
+                    onChanged: (val) {
+                      _typingTimer?.cancel();
+                      if (val.trim().isNotEmpty) {
+                        _setTyping(true);
+                        _typingTimer = Timer(const Duration(seconds: 2), () => _setTyping(false));
+                      } else {
+                        _setTyping(false);
+                      }
+                    },
+                    decoration: const InputDecoration(hintText: 'Type message...', border: InputBorder.none),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              GestureDetector(
+                onTap: _send,
+                child: Container(padding: const EdgeInsets.all(10), decoration: const BoxDecoration(color: accent, shape: BoxShape.circle), child: const Icon(Icons.send, color: Colors.white, size: 20)),
+              ),
+            ]),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickAndSendVideo() async {
+    final picked = await _imagePicker.pickVideo(source: ImageSource.gallery);
+    if (picked == null) return;
+
+    final file = File(picked.path);
+    final sizeInMb = (await file.length()) / (1024 * 1024);
+
+    if (sizeInMb > 3.0) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Video size must be less than 3MB'), backgroundColor: Colors.red));
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Video uploading...')));
+  }
+
+  void _showFullImage(BuildContext context, String url) {
+    showDialog(
+      context: context,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ClipRRect(borderRadius: BorderRadius.circular(15), child: Image.network(url, fit: BoxFit.contain)),
+          const SizedBox(height: 10),
+          IconButton(icon: const Icon(Icons.close, color: Colors.white, size: 30), onPressed: () => Navigator.pop(context)),
+        ]),
+      ),
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  STATUS PLAYER DIALOG (Supports Video & Image)
+// ════════════════════════════════════════════════════════════════
+
+class _StatusPlayerDialog extends StatefulWidget {
+  final String url;
+  final String type;
+  final String ownerId;
+  final String curUid;
+  final Map viewersMap;
+
+  const _StatusPlayerDialog({
+    required this.url, 
+    required this.type, 
+    required this.ownerId, 
+    required this.curUid,
+    required this.viewersMap,
+  });
+
+  @override
+  State<_StatusPlayerDialog> createState() => _StatusPlayerDialogState();
+}
+
+class _StatusPlayerDialogState extends State<_StatusPlayerDialog> {
+  VideoPlayerController? _videoController;
+  bool _isInitialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.type == 'video') {
+      _videoController = VideoPlayerController.networkUrl(Uri.parse(widget.url))
+        ..initialize().then((_) {
+          setState(() => _isInitialized = true);
+          _videoController?.play();
+          _videoController?.setLooping(true);
+        });
+    }
+  }
+
+  @override
+  void dispose() {
+    _videoController?.dispose();
+    super.dispose();
+  }
+
+  void _showViewerList() {
+    final viewerIds = widget.viewersMap.keys.toList();
+    
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => Container(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Viewed by', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xff250D57))),
+            const SizedBox(height: 15),
+            if (viewerIds.isEmpty)
+              const Center(child: Padding(padding: EdgeInsets.all(20), child: Text('No views yet', style: TextStyle(color: Colors.grey))))
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: viewerIds.length,
+                  itemBuilder: (_, i) {
+                    final uid = viewerIds[i];
+                    return StreamBuilder<DocumentSnapshot>(
+                      stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+                      builder: (context, snap) {
+                        String name = 'Loading...';
+                        String? photoUrl;
+                        if (snap.hasData && snap.data!.exists) {
+                          final d = snap.data!.data() as Map<String, dynamic>;
+                          name = d['displayName'] ?? d['name'] ?? 'User';
+                          photoUrl = d['photoUrl'];
+                        }
+                        return ListTile(
+                          leading: CircleAvatar(
+                            backgroundImage: photoUrl != null ? NetworkImage(photoUrl) : null,
+                            child: photoUrl == null ? const Icon(Icons.person) : null,
+                          ),
+                          title: Text(name),
+                          subtitle: Text(DateFormat('hh:mm a').format((widget.viewersMap[uid] as Timestamp).toDate())),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: Colors.black,
+      insetPadding: EdgeInsets.zero,
+      child: Stack(children: [
+        Center(
+          child: widget.type == 'video'
+              ? (_isInitialized
+                  ? AspectRatio(
+                      aspectRatio: _videoController!.value.aspectRatio,
+                      child: VideoPlayer(_videoController!),
+                    )
+                  : const CircularProgressIndicator(color: Colors.white))
+              : InteractiveViewer(
+                  child: Image.network(widget.url, fit: BoxFit.contain, width: double.infinity,
+                    errorBuilder: (_, __, ___) => const Center(child: Text('Failed to load image', style: TextStyle(color: Colors.white)))),
+                ),
+        ),
+        Positioned(top: 40, right: 20, child: IconButton(icon: const Icon(Icons.close, color: Colors.white, size: 30), onPressed: () => Navigator.pop(context))),
+        Positioned(
+          bottom: 30, left: 0, right: 0, 
+          child: GestureDetector(
+            onTap: widget.ownerId == widget.curUid ? _showViewerList : null,
+            child: Column(children: [
+              Icon(widget.type == 'video' ? Icons.play_circle_outline : Icons.visibility, color: Colors.white, size: 24),
+              const SizedBox(height: 4),
+              Text(
+                widget.ownerId == widget.curUid ? '${widget.viewersMap.length} views' : 'Watching ${widget.type}',
+                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)
+              ),
+              if (widget.ownerId == widget.curUid)
+                const Text('Tap to see who viewed', style: TextStyle(color: Colors.white70, fontSize: 10)),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MULTI-STATUS PLAYER  —  WhatsApp-style story viewer
+//  Cycles through all statuses of a user automatically.
+//  Records per-status view in Firestore.
+// ════════════════════════════════════════════════════════════════
+class _MultiStatusPlayerDialog extends StatefulWidget {
+  final List statuses;
+  final String ownerId;
+  final String curUid;
+  final bool isMe;
+  final FirebaseFirestore firestore;
+
+  const _MultiStatusPlayerDialog({
+    required this.statuses,
+    required this.ownerId,
+    required this.curUid,
+    required this.isMe,
+    required this.firestore,
+  });
+
+  @override
+  State<_MultiStatusPlayerDialog> createState() => _MultiStatusPlayerDialogState();
+}
+
+class _MultiStatusPlayerDialogState extends State<_MultiStatusPlayerDialog>
+    with SingleTickerProviderStateMixin {
+  int _currentIndex = 0;
+  late AnimationController _progressCtrl;
+  VideoPlayerController? _videoCtrl;
+  bool _videoReady = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _progressCtrl = AnimationController(vsync: this);
+    _progressCtrl.addStatusListener((status) {
+      if (status == AnimationStatus.completed) {
+        _nextStatus();
+      }
+    });
+    _loadStatus(_currentIndex);
+  }
+
+  Future<void> _loadStatus(int index) async {
+    _progressCtrl.stop();
+    _videoCtrl?.dispose();
+    _videoCtrl = null;
+    _videoReady = false;
+
+    final s = widget.statuses[index];
+    final type = s['type'] ?? 'image';
+    final url  = s['url']  ?? '';
+    final duration = type == 'video' ? const Duration(seconds: 30) : const Duration(seconds: 5);
+
+    if (type == 'video' && url.isNotEmpty) {
+      _videoCtrl = VideoPlayerController.networkUrl(Uri.parse(url));
+      await _videoCtrl!.initialize();
+      _videoCtrl!.play();
+      if (mounted) setState(() => _videoReady = true);
+    }
+
+    _progressCtrl.duration = duration;
+    _progressCtrl.forward(from: 0);
+
+    // Record view for this specific status (not if owner is viewing own)
+    if (!widget.isMe) {
+      _recordView(index);
+    }
+  }
+
+  void _recordView(int index) {
+    // Get the _origIndex that we attached earlier directly to point to the correct DB sub-document
+    final s = widget.statuses[index];
+    final origIndex = s['_origIndex'] ?? index;
+
+    // Use dot notation to merge the specific viewer UID into the nested map
+    // This prevents overwriting other viewers of the same status!
+    widget.firestore.collection('users').doc(widget.ownerId).update({
+      'statusViewedBy_$origIndex.${widget.curUid}': FieldValue.serverTimestamp(),
+    }).catchError((e) {
+      if (e.toString().contains('not-found') || e.toString().contains('no document')) {
+       // fallback if update fails (though doc should exist)
+       widget.firestore.collection('users').doc(widget.ownerId).set({
+         'statusViewedBy_$origIndex': {widget.curUid: FieldValue.serverTimestamp()},
+       }, SetOptions(merge: true));
+      }
+    });
+  }
+
+  Future<void> _deleteStatus() async {
+    _progressCtrl.stop();
+    _videoCtrl?.pause();
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Delete Status?'),
+        content: const Text('Are you sure you want to delete this status?'),
+        actions: [
+          TextButton(onPressed: () {
+            Navigator.pop(ctx, false);
+            _progressCtrl.forward();
+            _videoCtrl?.play();
+          }, child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: Colors.red))),
+        ],
+      )
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final s = widget.statuses[_currentIndex];
+      final origIndex = s['_origIndex'] ?? _currentIndex;
+      
+      final userDoc = await widget.firestore.collection('users').doc(widget.ownerId).get();
+      if (userDoc.exists) {
+        final data = userDoc.data() as Map<String, dynamic>;
+        List allStatuses = data['statuses'] ?? [];
+        if (origIndex < allStatuses.length) {
+          allStatuses.removeAt(origIndex);
+          await widget.firestore.collection('users').doc(widget.ownerId).update({
+            'statuses': allStatuses,
+          });
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Status deleted')));
+          if (mounted) Navigator.pop(context); // Close dialog to let UI refresh
+        }
+      }
+    } catch (e) {
+      debugPrint('Delete error: $e');
+      _progressCtrl.forward();
+      _videoCtrl?.play();
+    }
+  }
+
+  void _showViewerList(Map viewersMap) {
+    _progressCtrl.stop();
+    _videoCtrl?.pause();
+
+    final viewerIds = viewersMap.keys.toList();
+    
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => Container(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Viewed by', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xff250D57))),
+            const SizedBox(height: 15),
+            if (viewerIds.isEmpty)
+              const Center(child: Padding(padding: EdgeInsets.all(20), child: Text('No views yet', style: TextStyle(color: Colors.grey))))
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: viewerIds.length,
+                  itemBuilder: (_, i) {
+                    final uid = viewerIds[i];
+                    return StreamBuilder<DocumentSnapshot>(
+                      stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+                      builder: (context, snap) {
+                        String name = 'Loading...';
+                        String? photoUrl;
+                        if (snap.hasData && snap.data!.exists) {
+                          final d = snap.data!.data() as Map<String, dynamic>;
+                          name = d['displayName'] ?? d['name'] ?? 'User';
+                          photoUrl = d['photoUrl'];
+                        }
+                        return ListTile(
+                          leading: CircleAvatar(
+                            backgroundImage: photoUrl != null ? NetworkImage(photoUrl) : null,
+                            child: photoUrl == null ? const Icon(Icons.person) : null,
+                          ),
+                          title: Text(name),
+                          subtitle: Text(DateFormat('hh:mm a').format((viewersMap[uid] as Timestamp).toDate())),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+    ).then((_) {
+      if (mounted) {
+        _progressCtrl.forward();
+        _videoCtrl?.play();
+      }
+    });
+  }
+
+  void _nextStatus() {
+    if (_currentIndex < widget.statuses.length - 1) {
+      setState(() => _currentIndex++);
+      _loadStatus(_currentIndex);
+    } else {
+      Navigator.pop(context);
+    }
+  }
+
+  void _prevStatus() {
+    if (_currentIndex > 0) {
+      setState(() => _currentIndex--);
+      _loadStatus(_currentIndex);
+    }
+  }
+
+  @override
+  void dispose() {
+    _progressCtrl.dispose();
+    _videoCtrl?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s    = widget.statuses[_currentIndex];
+    final type = s['type'] ?? 'image';
+    final url  = s['url']  ?? '';
+    final total = widget.statuses.length;
+
+    return Dialog(
+      backgroundColor: Colors.black,
+      insetPadding: EdgeInsets.zero,
+      child: SizedBox.expand(
+        child: Stack(children: [
+          // ── Media ──
+          Center(
+            child: type == 'video'
+                ? (_videoReady && _videoCtrl != null
+                    ? AspectRatio(
+                        aspectRatio: _videoCtrl!.value.aspectRatio,
+                        child: VideoPlayer(_videoCtrl!),
+                      )
+                    : const CircularProgressIndicator(color: Colors.white))
+                : InteractiveViewer(
+                    child: Image.network(
+                      url, fit: BoxFit.contain, width: double.infinity,
+                      errorBuilder: (_, __, ___) => const Center(
+                        child: Text('Failed to load', style: TextStyle(color: Colors.white))),
+                    ),
+                  ),
+          ),
+
+          // ── Progress bars (one per status) ──
+          Positioned(
+            top: 40, left: 12, right: 12,
+            child: Row(
+              children: List.generate(total, (i) {
+                return Expanded(
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 2),
+                    height: 3,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                    child: i < _currentIndex
+                        ? Container(color: Colors.white)
+                        : i == _currentIndex
+                            ? AnimatedBuilder(
+                                animation: _progressCtrl,
+                                builder: (_, __) => FractionallySizedBox(
+                                  alignment: Alignment.centerLeft,
+                                  widthFactor: _progressCtrl.value,
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      color: Colors.white,
+                                      borderRadius: BorderRadius.circular(2),
+                                    ),
+                                  ),
+                                ),
+                              )
+                            : const SizedBox.shrink(),
+                  ),
+                );
+              }),
+            ),
+          ),
+
+          // ── Status index label ──
+          Positioned(
+            top: 55, left: 16,
+            child: Text(
+              '${_currentIndex + 1} / $total',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ),
+
+          // ── Close button ──
+          Positioned(
+            top: 45, right: 12,
+            child: IconButton(
+              icon: const Icon(Icons.close, color: Colors.white, size: 28),
+              onPressed: () => Navigator.pop(context),
+            ),
+          ),
+
+          // ── Tap left half = prev, right half = next ──
+          Positioned.fill(
+            child: Row(children: [
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _prevStatus,
+                ),
+              ),
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _nextStatus,
+                ),
+              ),
+            ]),
+          ),
+
+          // ── Bottom: status info and actions ──
+          Positioned(
+            bottom: 30, left: 20, right: 20,
+            child: Column(
+              children: [
+                if (widget.isMe) ...[
+                  GestureDetector(
+                    onTap: () => _showViewerList(s['_viewers'] as Map? ?? {}),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.keyboard_arrow_up, color: Colors.white, size: 24),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${(s['_viewers'] as Map? ?? {}).length} views',
+                          style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 15),
+                ],
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    // Type and Count indicator
+                    Row(
+                      children: [
+                        Icon(
+                          type == 'video' ? Icons.videocam : Icons.image,
+                          color: Colors.white54, size: 16,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Status ${_currentIndex + 1} of $total',
+                          style: const TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                    
+                    // Delete Button
+                    if (widget.isMe)
+                      IconButton(
+                        icon: const Icon(Icons.delete, color: Colors.white70, size: 24),
+                        onPressed: _deleteStatus,
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
 }

@@ -1,10 +1,4 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:my_app1/SignUp/loginscreen.dart';
-import 'package:my_app1/Dashboard/homepage.dart';
-
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -15,63 +9,39 @@ class SplashScreen extends StatefulWidget {
 
 class _SplashScreenState extends State<SplashScreen> {
   @override
-  void initState() {
-    super.initState();
-    _navigateToLogin();
-  }
-
-  void _navigateToLogin() async {
-    Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        final user = FirebaseAuth.instance.currentUser;
-        if (user != null) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => HomePage()),
-          );
-        } else {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => const LoginPage()),
-          );
-        }
-      }
-    });
-  }
-
-  @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.transparent,
       body: Container(
         height: double.infinity,
         width: double.infinity,
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
             colors: [
-              Color(0xff6A5ACD),
-              Color(0xff9B59B6),
-              Color(0xffF4A261)],
+              Color(0xff250D57),
+              Color(0xff38B6FF),
+            ],
           ),
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Image.asset("assets/Images/logo.png", height: 250),
-
-            Center(
-              child: Text(
-                "Let family & friends know\nyou're safe!",
-                style: TextStyle(
-                  color: Colors.black,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 20,
-                ),
-              ),
+            // Safe image loading
+            Image.asset("assets/Images/logo.png", height: 200, errorBuilder: (c, e, s) => const Icon(Icons.security, size: 100, color: Colors.white)),
+            const SizedBox(height: 30),
+            const Text(
+              "VANGUARD",
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 28, letterSpacing: 2),
             ),
+            const SizedBox(height: 10),
+            const Text(
+              "Let family & friends know you're safe!",
+              style: TextStyle(color: Colors.white70, fontSize: 16),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 50),
+            const CircularProgressIndicator(color: Colors.white70),
           ],
         ),
       ),

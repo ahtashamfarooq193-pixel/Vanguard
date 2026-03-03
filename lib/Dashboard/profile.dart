@@ -1,18 +1,18 @@
 import 'dart:io';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:my_app1/MainLayout/mainlayout.dart';
-import 'package:my_app1/SignUp/loginscreen.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:my_app1/services/cloudinary_service.dart';
 import 'package:my_app1/bottombar.dart';
 import 'package:my_app1/Dashboard/homepage.dart';
 import 'package:my_app1/Dashboard/chat.dart';
 import 'package:my_app1/Dashboard/location.dart';
-import 'package:my_app1/ForgotPassword/forgotpasswordscreen.dart';
 import 'package:my_app1/Dashboard/privacypolicy.dart';
-import 'package:my_app1/services/cloudinary_service.dart';
+import 'package:my_app1/SignUp/loginscreen.dart';
+import 'package:my_app1/auth_gate.dart';
 
 class Profile extends StatefulWidget {
   const Profile({super.key});
@@ -22,15 +22,26 @@ class Profile extends StatefulWidget {
 }
 
 class _ProfileState extends State<Profile> {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
   final ImagePicker _picker = ImagePicker();
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final GoogleSignIn _googleSignIn = GoogleSignIn();
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  
   int _selectedIndex = 3;
-  String _bio = "Add a bio...";
-  String _phone = "Add phone number";
+  
+  // Profile Data
+  String _name = "Safe User";
+  String _email = "user@vanguard.com";
+  String _phone = "+92 300 1234567";
+  String _bio = "Your safety is our priority.";
   String? _localImagePath;
-  String? _profilePictureUrl; // Cloudinary URL
+  String? _firebasePhotoUrl;
+  
+  // Settings
   bool _notificationsEnabled = true;
-  bool _isUploading = false; // Track upload state
+  bool _locationSharing = true;
+  int _contactCount = 0;
+  bool _isUploadingPic = false;
 
   @override
   void initState() {
@@ -40,536 +51,405 @@ class _ProfileState extends State<Profile> {
 
   Future<void> _loadProfileData() async {
     final prefs = await SharedPreferences.getInstance();
+    final user = _auth.currentUser;
+
     setState(() {
-      _bio = prefs.getString('user_bio') ?? "Software Developer at TechCorp";
-      _phone = prefs.getString('user_phone') ?? "+92 300 1234567";
+      // Priority: Firebase User Data > SharedPreferences > Default
+      _name = user?.displayName ?? prefs.getString('display_name') ?? "Safe User";
+      _email = user?.email ?? "user@vanguard.com";
+      _phone = user?.phoneNumber ?? prefs.getString('user_phone') ?? "+92 300 1234567";
+      _firebasePhotoUrl = user?.photoURL;
+      
+      _bio = prefs.getString('user_bio') ?? "Your safety is our priority.";
       _localImagePath = prefs.getString('profile_image_path');
-      _profilePictureUrl = prefs.getString('profile_image_url'); // Load Cloudinary URL
       _notificationsEnabled = prefs.getBool('notifications_enabled') ?? true;
+      _locationSharing = prefs.getBool('location_sharing') ?? true;
+      
+      final contactsList = prefs.getStringList('emergency_contacts_list');
+      _contactCount = contactsList?.length ?? 0;
     });
   }
 
-  Future<void> _saveProfileData(String key, dynamic value) async {
+  Future<void> _handleLogout() async {
+    try {
+      // 1. Sign out from Firebase and Google securely
+      // Added catchError to prevent failure if Google wasn't used to sign in
+      await _googleSignIn.signOut().catchError((e) => null);
+      await _googleSignIn.disconnect().catchError((e) => null);
+      await _auth.signOut();
+      
+      if (!mounted) return;
+
+      // 2. FORCE reset the entire app to the AuthGate
+      // It will automatically check Firebase and show LoginPage
+      Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (context) => const AuthGate()),
+        (route) => false,
+      );
+      
+      debugPrint("✅ Logged out successfully and stack cleared");
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Logout failed: $e")));
+    }
+  }
+
+  Future<void> _updateField(String key, String value) async {
     final prefs = await SharedPreferences.getInstance();
-    if (value is String) {
-      await prefs.setString(key, value);
-    } else if (value is bool) {
-      await prefs.setBool(key, value);
+    await prefs.setString(key, value);
+    
+    // Also update Firebase display name if name is changed
+    if (key == 'display_name') {
+      await _auth.currentUser?.updateDisplayName(value);
     }
-
-    // Sync with Firestore if user is logged in
-    final user = _auth.currentUser;
-    if (user != null) {
-      final updateData = <String, dynamic>{};
-      if (key == 'user_bio') updateData['bio'] = value;
-      if (key == 'user_phone') updateData['phone'] = value;
-      if (key == 'display_name') updateData['fullName'] = value;
-      if (key == 'notifications_enabled') updateData['notificationsEnabled'] = value;
-      if (key == 'profile_image_path') updateData['profileImagePath'] = value;
-
-      if (updateData.isNotEmpty) {
-        await FirebaseFirestore.instance
-            .collection('users')
-            .doc(user.uid)
-            .set(updateData, SetOptions(merge: true));
-      }
-    }
+    
+    _loadProfileData();
   }
 
   Future<void> _updateProfilePicture() async {
-    try {
-      final XFile? image = await _picker.pickImage(
-        source: ImageSource.gallery,
-        maxWidth: 1080,
-        maxHeight: 1080,
-        imageQuality: 85,
-      );
-      if (image == null) return;
-
-      setState(() {
-        _isUploading = true;
-        _localImagePath = image.path; // Show preview immediately
-      });
-
-      // Upload to Cloudinary
-      final imageUrl = await CloudinaryService.uploadImage(image.path);
-
-      if (imageUrl != null) {
-        setState(() {
-          _profilePictureUrl = imageUrl;
-          _isUploading = false;
-        });
+    final XFile? image = await _picker.pickImage(source: ImageSource.gallery, imageQuality: 50, maxWidth: 512);
+    if (image != null) {
+      setState(() => _isUploadingPic = true);
+      
+      try {
+        final file = File(image.path);
+        // Upload to Cloudinary to get public link
+        final link = await CloudinaryService.uploadFile(file);
         
-        // Save URL to Firestore and local storage
-        await _saveProfileData('profile_image_url', imageUrl);
-        _showSnackBar('Profile picture updated successfully!');
-      } else {
-        setState(() {
-          _isUploading = false;
-          _localImagePath = null;
-        });
-        _showSnackBar('Failed to upload image');
+        if (link != null) {
+          final user = _auth.currentUser;
+          if (user != null) {
+            // Update Auth Profile
+            await user.updatePhotoURL(link);
+            
+            // Update Firestore Profile
+            await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+              'photoUrl': link,
+            }, SetOptions(merge: true));
+            
+            setState(() {
+              _firebasePhotoUrl = link;
+              _localImagePath = image.path;
+            });
+            
+            if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Profile picture updated successfully!")));
+          }
+        } else {
+          final msg = CloudinaryService.lastErrorMessage ?? "Failed to upload image to Cloudinary.";
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text(msg), backgroundColor: Colors.red),
+            );
+          }
+        }
+      } catch (e) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e"), backgroundColor: Colors.red));
       }
-    } catch (e) {
-      setState(() {
-        _isUploading = false;
-        _localImagePath = null;
-      });
-      _showSnackBar('Error updating image: $e');
+      
+      setState(() => _isUploadingPic = false);
     }
   }
 
-  Future<void> _editField(String title, String currentVal, String key) async {
+  void _showEditDialog(String title, String currentVal, String key) {
     TextEditingController controller = TextEditingController(text: currentVal);
-    await showDialog(
+    showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Text("Update $title", style: TextStyle(color: Color(0xff250D57), fontWeight: FontWeight.bold)),
+        title: Text("Edit $title", style: const TextStyle(fontWeight: FontWeight.bold)),
         content: TextField(
           controller: controller,
+          maxLines: key == 'user_bio' ? 3 : 1,
           decoration: InputDecoration(
             hintText: "Enter $title",
             filled: true,
-            fillColor: Colors.grey.shade100,
+            fillColor: const Color(0xffF1F2F6),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: Text("Cancel", style: TextStyle(color: Colors.grey))),
-          ElevatedButton(
-            onPressed: () async {
-              String newValue = controller.text.trim();
-              if (newValue.isEmpty) return;
-
-              if (key == 'user_phone') {
-                Navigator.pop(context); // Close edit dialog
-                _startPhoneVerification(newValue);
-              } else {
-                setState(() {
-                  if (key == 'user_bio') _bio = newValue;
-                  if (key == 'display_name') {
-                    _auth.currentUser?.updateDisplayName(newValue);
-                  }
-                });
-                await _saveProfileData(key, newValue);
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text("$title updated successfully"), duration: const Duration(seconds: 1)),
-                  );
-                  Navigator.pop(context); // Close dialog
-                }
-              }
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Color(0xff38B6FF),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-            ),
-            child: Text("Save", style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _startPhoneVerification(String phoneNumber) async {
-    // Ensure phone number is in international format
-    if (!phoneNumber.startsWith('+')) {
-      _showSnackBar('Please enter phone number with country code (e.g., +92...)');
-      return;
-    }
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const Center(child: CircularProgressIndicator()),
-    );
-
-    await _auth.verifyPhoneNumber(
-      phoneNumber: phoneNumber,
-      verificationCompleted: (PhoneAuthCredential credential) async {
-        Navigator.pop(context); // Close loading
-        await _auth.currentUser?.updatePhoneNumber(credential);
-        _onPhoneVerified(phoneNumber);
-      },
-      verificationFailed: (FirebaseAuthException e) {
-        Navigator.pop(context); // Close loading
-        _showSnackBar('Verification failed: ${e.message}');
-      },
-      codeSent: (String verificationId, int? resendToken) {
-        Navigator.pop(context); // Close loading
-        _showOtpDialog(phoneNumber, verificationId);
-      },
-      codeAutoRetrievalTimeout: (String verificationId) {},
-    );
-  }
-
-  void _showOtpDialog(String phoneNumber, String verificationId) {
-    TextEditingController otpController = TextEditingController();
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text("Enter OTP"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text("Verification code sent to $phoneNumber"),
-            TextField(
-              controller: otpController,
-              keyboardType: TextInputType.number,
-              maxLength: 6,
-              decoration: const InputDecoration(hintText: "6-digit code"),
-            ),
-          ],
-        ),
-        actions: [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
           ElevatedButton(
-            onPressed: () async {
-              String smsCode = otpController.text.trim();
-              if (smsCode.length == 6) {
-                try {
-                  PhoneAuthCredential credential = PhoneAuthProvider.credential(
-                    verificationId: verificationId,
-                    smsCode: smsCode,
-                  );
-                  Navigator.pop(context); // Close OTP dialog
-                  
-                  showDialog(
-                    context: context,
-                    barrierDismissible: false,
-                    builder: (context) => const Center(child: CircularProgressIndicator()),
-                  );
-
-                  await _auth.currentUser?.updatePhoneNumber(credential);
-                  Navigator.pop(context); // Close loading
-                  _onPhoneVerified(phoneNumber);
-                } catch (e) {
-                  Navigator.pop(context); // Close loading
-                  _showSnackBar('Invalid OTP or Verification Failed');
-                }
-              }
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xff250D57),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () {
+              _updateField(key, controller.text.trim());
+              Navigator.pop(context);
             },
-            child: const Text("Verify"),
+            child: const Text("Save Changes"),
           ),
         ],
       ),
     );
-  }
-
-  void _onPhoneVerified(String phoneNumber) async {
-    setState(() {
-      _phone = phoneNumber;
-    });
-    await _saveProfileData('user_phone', phoneNumber);
-    _showSnackBar('Phone number verified and updated successfully!');
-  }
-
-  Future<void> _changePassword() async {
-    final user = _auth.currentUser;
-    if (user != null && user.email != null) {
-      // Navigate to Forgotpass screen to trigger OTP flow
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (context) => const Forgotpass()),
-      );
-    }
-  }
-
-  void _showSnackBar(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), behavior: SnackBarBehavior.floating));
   }
 
   @override
   Widget build(BuildContext context) {
-    return MainLayout(
-      content: StreamBuilder<User?>(
-        stream: _auth.userChanges(),
-        builder: (context, snapshot) {
-          final user = snapshot.data;
-          
-          return SingleChildScrollView(
-            child: Column(
-              children: [
-                _buildHeader(user),
-                Padding(
-                  padding: const EdgeInsets.all(20.0),
-                  child: Column(
-                    children: [
-                      _buildInfoSection(user),
-                      SizedBox(height: 25),
-                      _buildSettingsSection(),
-                      SizedBox(height: 30),
-                      _buildSignOutButton(),
-                      SizedBox(height: 40),
-                    ],
-                  ),
-                ),
-              ],
+    const Color primaryColor = Color(0xff250D57);
+    const Color accentColor = Color(0xff38B6FF);
+
+    return Scaffold(
+      backgroundColor: const Color(0xffF8F9FE),
+      body: CustomScrollView(
+        physics: const BouncingScrollPhysics(),
+        slivers: [
+          _buildSliverAppBar(primaryColor, accentColor),
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Column(
+                children: [
+                  const SizedBox(height: 25),
+                  _buildQuickActionCard(accentColor),
+                  const SizedBox(height: 25),
+                  _buildSectionTitle("Identity Details"),
+                  const SizedBox(height: 12),
+                  _buildInfoCard([
+                    _buildInfoTile(Icons.person_outline, "Name", _name, () => _showEditDialog("Name", _name, 'display_name')),
+                    _buildInfoTile(Icons.phone_outlined, "Mobile", _phone, () => _showEditDialog("Phone", _phone, 'user_phone')),
+                    _buildInfoTile(Icons.email_outlined, "Email", _email, null),
+                  ]),
+                  const SizedBox(height: 25),
+                  _buildSectionTitle("Safety Preferences"),
+                  const SizedBox(height: 12),
+                  _buildInfoCard([
+                    _buildSwitchTile(Icons.notifications_active_outlined, "Notifications", _notificationsEnabled, (val) {
+                      setState(() => _notificationsEnabled = val);
+                      SharedPreferences.getInstance().then((p) => p.setBool('notifications_enabled', val));
+                    }),
+                    _buildSwitchTile(Icons.my_location_outlined, "Location Sharing", _locationSharing, (val) {
+                      setState(() => _locationSharing = val);
+                      SharedPreferences.getInstance().then((p) => p.setBool('location_sharing', val));
+                    }),
+                    _buildInfoTile(Icons.lock_outline, "Security", "Password & Security", () {}),
+                  ]),
+                  const SizedBox(height: 25),
+                  _buildSectionTitle("Legal & Info"),
+                  const SizedBox(height: 12),
+                  _buildInfoCard([
+                    _buildInfoTile(Icons.article_outlined, "Privacy Policy", "Data Protection", () {
+                      Navigator.push(context, MaterialPageRoute(builder: (_) => const PrivacyPolicyScreen()));
+                    }),
+                    _buildInfoTile(Icons.help_center_outlined, "Support Center", "Contact us", () {}),
+                  ]),
+                  const SizedBox(height: 35),
+                  _buildLogoutButton(),
+                  const SizedBox(height: 60),
+                ],
+              ),
             ),
-          );
-        },
+          ),
+        ],
       ),
       bottomNavigationBar: MyBottomBar(
         selectedIndex: _selectedIndex,
         onTap: (index) {
           if (index == _selectedIndex) return;
-          
-          Widget nextScreen;
-          switch (index) {
-            case 0:
-              nextScreen = HomePage();
-              break;
-            case 1:
-              nextScreen = const ChatSelectionScreen();
-              break;
-            case 2:
-              nextScreen = const Location();
-              break;
-            case 3:
-              nextScreen = const Profile();
-              break;
-            default:
-              nextScreen = HomePage();
-          }
-
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => nextScreen),
-          );
+          Widget next;
+          if (index == 0) next = HomePage();
+          else if (index == 1) next = const ChatSelectionScreen();
+          else if (index == 2) next = const Location();
+          else next = const Profile();
+          Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => next));
         },
       ),
     );
   }
 
-  Widget _buildHeader(User? user) {
-    return Container(
-      width: double.infinity,
-      padding: EdgeInsets.only(top: 40, bottom: 30),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [Color(0xff250D57), Color(0xff4A148C)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.only(
-          bottomLeft: Radius.circular(40),
-          bottomRight: Radius.circular(40),
-        ),
-      ),
-      child: Column(
-        children: [
-          Stack(
+  Widget _buildSliverAppBar(Color primary, Color accent) {
+    return SliverAppBar(
+      expandedHeight: 250,
+      pinned: true,
+      elevation: 0,
+      backgroundColor: primary,
+      automaticallyImplyLeading: false,
+      title: const Text("", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+      centerTitle: true,
+      flexibleSpace: FlexibleSpaceBar(
+        background: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [primary, const Color(0xff1A093D)],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Container(
-                padding: EdgeInsets.all(4),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white.withValues(alpha: 0.5), width: 2),
-                ),
-                child: Stack(
-                  children: [
-                    CircleAvatar(
-                      radius: 60,
-                      backgroundColor: Colors.white24,
-                      backgroundImage: _profilePictureUrl != null
-                          ? NetworkImage(_profilePictureUrl!) // Cloudinary URL
-                          : (_localImagePath != null 
-                              ? FileImage(File(_localImagePath!)) 
-                              : (user?.photoURL != null ? NetworkImage(user!.photoURL!) : null)) as ImageProvider?,
-                      child: (_profilePictureUrl == null && _localImagePath == null && user?.photoURL == null) 
-                        ? Icon(Icons.person, size: 70, color: Colors.white) 
-                        : null,
-                    ),
-                    // Loading indicator during upload
-                    if (_isUploading)
-                      Positioned.fill(
-                        child: Container(
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.black.withValues(alpha: 0.5),
-                          ),
-                          child: Center(
-                            child: CircularProgressIndicator(
-                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              Positioned(
-                bottom: 5,
-                right: 5,
-                child: GestureDetector(
-                  onTap: _isUploading ? null : _updateProfilePicture, // Disable during upload
-                  child: Container(
-                    padding: EdgeInsets.all(8),
+              const SizedBox(height: 40),
+              Stack(
+                children: [
+                  Container(
+                    width: 110,
+                    height: 110,
                     decoration: BoxDecoration(
-                      color: _isUploading ? Colors.grey : Color(0xff38B6FF),
                       shape: BoxShape.circle,
-                      boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2))],
+                      border: Border.all(color: Colors.white.withOpacity(0.15), width: 4),
+                      boxShadow: [
+                        BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 15, offset: const Offset(0, 5))
+                      ],
                     ),
-                    child: Icon(
-                      _isUploading ? Icons.hourglass_empty : Icons.edit_rounded, 
-                      color: Colors.white, 
-                      size: 20
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        CircleAvatar(
+                          radius: 55,
+                          backgroundColor: Colors.white10,
+                          backgroundImage: _firebasePhotoUrl != null 
+                            ? NetworkImage(_firebasePhotoUrl!) as ImageProvider
+                            : (_localImagePath != null ? FileImage(File(_localImagePath!)) : null),
+                          child: (_firebasePhotoUrl == null && _localImagePath == null) ? const Icon(Icons.person, size: 60, color: Colors.white) : null,
+                        ),
+                        if (_isUploadingPic)
+                          const CircularProgressIndicator(color: Colors.white),
+                      ],
                     ),
                   ),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: 15),
-          Text(
-            user?.displayName ?? "User Name",
-            style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 1),
-          ),
-          SizedBox(height: 5),
-          Text(
-            user?.email ?? "email@example.com",
-            style: TextStyle(color: Colors.white70, fontSize: 16),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildInfoSection(User? user) {
-    return Container(
-      padding: EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(25),
-        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 15, offset: Offset(0, 5))],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text("Personal Info", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xff250D57))),
-              TextButton(
-                onPressed: () => _editField("Name", user?.displayName ?? "", 'display_name'),
-                child: Text("Edit", style: TextStyle(color: Color(0xff38B6FF))),
-              ),
-            ],
-          ),
-          Divider(),
-          _buildInfoRow(Icons.person_outline, "Full Name", user?.displayName ?? "Not set"),
-          _buildInfoRow(Icons.phone_outlined, "Phone", _phone, onTap: () => _editField("Phone", _phone, 'user_phone')),
-          _buildInfoRow(Icons.info_outline, "Bio", _bio, onTap: () => _editField("Bio", _bio, 'user_bio')),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildInfoRow(IconData icon, String label, String value, {VoidCallback? onTap}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12.0),
-      child: InkWell(
-        onTap: onTap,
-        child: Row(
-          children: [
-            Container(
-              padding: EdgeInsets.all(8),
-              decoration: BoxDecoration(color: Color(0xff38B6FF).withValues(alpha: 0.1), borderRadius: BorderRadius.circular(10)),
-              child: Icon(icon, color: Color(0xff38B6FF), size: 22),
-            ),
-            SizedBox(width: 15),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(label, style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  Text(value, style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xff250D57))),
+                  Positioned(
+                    bottom: 0,
+                    right: 0,
+                    child: GestureDetector(
+                      onTap: _updateProfilePicture,
+                      child: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(color: accent, shape: BoxShape.circle, border: Border.all(color: primary, width: 2)),
+                        child: const Icon(Icons.camera_alt, color: Colors.white, size: 16),
+                      ),
+                    ),
+                  ),
                 ],
               ),
-            ),
-            if (onTap != null) Icon(Icons.chevron_right, color: Colors.grey, size: 20),
-          ],
+              const SizedBox(height: 15),
+              Text(_name, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              Text(_bio, style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 13)),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildSettingsSection() {
+  Widget _buildQuickActionCard(Color accent) {
+    final user = _auth.currentUser;
     return Container(
-      padding: EdgeInsets.all(20),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(25),
-        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 15, offset: Offset(0, 5))],
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 15, offset: const Offset(0, 5))],
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text("Account Settings", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xff250D57))),
-          Divider(),
-          _buildSettingTile(Icons.lock_outline, "Change Password", _changePassword),
-          _buildSettingTile(
-            Icons.notifications_none_outlined, 
-            "Notifications", 
-            () {}, 
-            trailing: Switch.adaptive(
-              value: _notificationsEnabled, 
-              activeThumbColor: Color(0xff38B6FF),
-              onChanged: (val) {
-                setState(() => _notificationsEnabled = val);
-                _saveProfileData('notifications_enabled', val);
-              },
-            ),
+          StreamBuilder<QuerySnapshot>(
+            stream: _firestore.collection('users').doc(user?.uid).collection('contacts').snapshots(),
+            builder: (context, snapshot) {
+              final count = snapshot.data?.docs.length ?? 0;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("Emergency Contacts", style: TextStyle(color: Colors.grey, fontSize: 13, fontWeight: FontWeight.w500)),
+                  const SizedBox(height: 5),
+                  Text("$count Registered", style: const TextStyle(color: Color(0xff2D3142), fontSize: 18, fontWeight: FontWeight.w800)),
+                ],
+              );
+            }
           ),
-          _buildSettingTile(Icons.privacy_tip_outlined, "Privacy Policy", () {
-            Navigator.push(
-              context,
-              MaterialPageRoute(builder: (context) => const PrivacyPolicyScreen()),
-            );
-          }),
-          _buildSettingTile(Icons.help_outline, "Help & Support", () {}),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xff250D57),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+              elevation: 0,
+              padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
+            ),
+            onPressed: () {
+               Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => HomePage()));
+            },
+            child: const Text("Manage List", style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildSettingTile(IconData icon, String title, VoidCallback onTap, {Widget? trailing}) {
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: Container(
-        padding: EdgeInsets.all(8),
-        decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(10)),
-        child: Icon(icon, color: Color(0xff250D57), size: 22),
+  Widget _buildSectionTitle(String title) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Text(
+        title.toUpperCase(),
+        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: Color(0xff9DA3B4), letterSpacing: 1.5),
       ),
-      title: Text(title, style: TextStyle(fontWeight: FontWeight.w500, color: Color(0xff250D57))),
-      trailing: trailing ?? Icon(Icons.arrow_forward_ios, size: 14, color: Colors.grey),
-      onTap: onTap,
     );
   }
 
-  Widget _buildSignOutButton() {
-    return SizedBox(
-      width: double.infinity,
-      height: 55,
-      child: ElevatedButton(
-        onPressed: () => _auth.signOut().then((_) => Navigator.pushAndRemoveUntil(
-          context, MaterialPageRoute(builder: (context) => LoginPage()), (route) => false)),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: Colors.red.shade50,
-          foregroundColor: Colors.red,
-          elevation: 0,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18), side: BorderSide(color: Colors.red.shade100)),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.logout_rounded),
-            SizedBox(width: 10),
-            Text("Sign Out", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-          ],
+  Widget _buildInfoCard(List<Widget> children) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(25),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 15, offset: const Offset(0, 5))],
+      ),
+      child: Column(children: children),
+    );
+  }
+
+  Widget _buildInfoTile(IconData icon, String label, String value, VoidCallback? onTap) {
+    return ListTile(
+      onTap: onTap,
+      leading: Container(
+        height: 45,
+        width: 45,
+        decoration: BoxDecoration(color: const Color(0xffF5F7FB), borderRadius: BorderRadius.circular(15)),
+        child: Icon(icon, color: const Color(0xff250D57), size: 22),
+      ),
+      title: Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey, fontWeight: FontWeight.w500)),
+      subtitle: Text(value, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Color(0xff2D3142))),
+      trailing: onTap != null ? const Icon(Icons.arrow_forward_ios, size: 14, color: Color(0xffD1D5DB)) : null,
+    );
+  }
+
+  Widget _buildSwitchTile(IconData icon, String label, bool value, Function(bool) onChanged) {
+    return ListTile(
+      leading: Container(
+        height: 45,
+        width: 45,
+        decoration: BoxDecoration(color: const Color(0xffF5F7FB), borderRadius: BorderRadius.circular(15)),
+        child: Icon(icon, color: const Color(0xff250D57), size: 22),
+      ),
+      title: Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Color(0xff2D3142))),
+      trailing: Switch.adaptive(
+        value: value,
+        onChanged: onChanged,
+        activeColor: const Color(0xff38B6FF),
+      ),
+    );
+  }
+
+  Widget _buildLogoutButton() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      child: InkWell(
+        onTap: _handleLogout,
+        child: Container(
+          height: 55,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.red.withOpacity(0.1)),
+          ),
+          child: const Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.logout_rounded, color: Colors.red, size: 20),
+              SizedBox(width: 12),
+              Text("Logout Securely", style: TextStyle(color: Colors.red, fontWeight: FontWeight.w800, fontSize: 16)),
+            ],
+          ),
         ),
       ),
     );

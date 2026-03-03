@@ -14,36 +14,42 @@ class MainLayout extends StatelessWidget {
       body: Container(
         width: double.infinity,
         height: double.infinity,
-        decoration: BoxDecoration(
+        decoration: const BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
             colors: [
-              Color(0xff6A5ACD).withValues(alpha: 0.5),
-              Color(0xff9B59B6).withValues(alpha: 0.6),
-              Color(0xffF4A261).withValues(alpha: 0.6),
+              Color(0xff250D57), // Deep Violet/Navy
+              Color(0xff38B6FF), // Bright Blue
             ],
           ),
         ),
         child: Column(
           children: [
             Expanded(
-              flex: 5,
+              flex: 1, // 25% of the screen
               child: Container(
                 width: double.infinity,
-                child: Column(
+                child: const Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Image.asset(
-                      "assets/Images/logo.png",
-                      scale: 2.5,
+                    Text(
+                      "Vanguard",
+                      style: TextStyle(
+                        fontSize: 34, // Slightly smaller font to fit well
+                        fontWeight: FontWeight.w900,
+                        color: Colors.white,
+                        letterSpacing: 1.2,
+                      ),
                     ),
-                    const Text(
-                      "Let family & friends know \n you're safe!",
+                    SizedBox(height: 5),
+                    Text(
+                      "Let family & friends know you're safe!",
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        fontSize: 21,
-                        color: Colors.black87,
+                        fontSize: 14,
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
                   ],
@@ -51,7 +57,7 @@ class MainLayout extends StatelessWidget {
               ),
             ),
             Expanded(
-              flex: 6,
+              flex: 3, // 75% of the screen
               child: Container(
                 width: double.infinity,
                 decoration: const BoxDecoration(

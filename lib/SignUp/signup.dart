@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
-import 'package:my_app1/MainLayout/mainlayout.dart';
-import 'package:my_app1/SignUp/loginscreen.dart';
-import 'package:my_app1/SignUp/namescreen.dart';
-import 'package:my_app1/SignUp/privacyterm.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:my_app1/MainLayout/mainlayout.dart';
+import 'package:my_app1/SignUp/loginscreen.dart';
+import 'package:my_app1/SignUp/privacyterm.dart';
+import 'package:my_app1/Dashboard/homepage.dart';
+import 'package:my_app1/auth_gate.dart';
 
 class SignUp extends StatefulWidget {
   const SignUp({super.key});
@@ -17,295 +18,179 @@ class SignUp extends StatefulWidget {
 class _SignUpState extends State<SignUp> {
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _emailController = TextEditingController();
-  TextEditingController usernameController = TextEditingController();
+  final TextEditingController _usernameController = TextEditingController();
   final _formKey = GlobalKey<FormState>();
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  
   bool _obscurePassword = true;
-  bool _rememberMe = false;
+  bool _isLoading = false;
+  bool _agreeToTerms = false;
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), backgroundColor: Colors.red));
+  }
+
+  Future<void> _handleSignUp() async {
+    if (!_formKey.currentState!.validate()) return;
+    if (!_agreeToTerms) {
+      _showError("Please agree to the Privacy Policy & Terms");
+      return;
+    }
+
+    setState(() => _isLoading = true);
+    try {
+      // Create user in Firebase
+      final UserCredential userCredential = await _auth.createUserWithEmailAndPassword(
+        email: _emailController.text.trim(),
+        password: _passwordController.text.trim(),
+      );
+
+      // Update Display Name if user provided username here
+      if (userCredential.user != null) {
+        final user = userCredential.user!;
+        final name = _usernameController.text.trim();
+        await user.updateDisplayName(name);
+
+        // Save to Firestore
+        final token = await FirebaseMessaging.instance.getToken();
+        await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+          'uid': user.uid,
+          'name': name,
+          'email': user.email,
+          'photoUrl': user.photoURL, // Cloudinary or Google photoUrl
+          'fcmToken': token,
+          'createdAt': FieldValue.serverTimestamp(),
+          'lastTokenUpdate': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
+
+      if (mounted) {
+        // Proceed directly to AuthGate (frictionless sign-up flow)
+        Navigator.pushAndRemoveUntil(
+          context, 
+          MaterialPageRoute(builder: (_) => const AuthGate()),
+          (route) => false,
+        );
+      }
+    } on FirebaseAuthException catch (e) {
+      _showError(e.message ?? "Registration failed");
+    } catch (e) {
+      _showError("An unexpected error occurred: $e");
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final themeColor = const Color(0xff250D57);
+    final accentColor = const Color(0xff38B6FF);
+
     return MainLayout(
-      content: Column(
-        mainAxisAlignment: MainAxisAlignment.start,
-        children: [
-          SizedBox(height: 20),
-          Center(
-            child: Text(
-              "Create Your Account",
-              style: TextStyle(
-                color: Colors.black,
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
+      content: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        child: Column(
+          children: [
+            const SizedBox(height: 30),
+            const Text("Create Your Account", style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            const Text("Sign up to send alerts and stay protected anytime", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)),
+            const SizedBox(height: 40),
+            
+            Form(
+              key: _formKey,
+              child: Column(
+                children: [
+                  _buildTextField(_usernameController, "User Name", Icons.person_outline),
+                  const SizedBox(height: 15),
+                  _buildTextField(_emailController, "Email", Icons.email_outlined, isEmail: true),
+                  const SizedBox(height: 15),
+                  _buildTextField(
+                    _passwordController, 
+                    "Password", 
+                    Icons.lock_outline, 
+                    isPassword: true,
+                    obscure: _obscurePassword,
+                    onToggle: () => setState(() => _obscurePassword = !_obscurePassword),
+                  ),
+                ],
               ),
             ),
-          ),
-          SizedBox(height: 10),
-          Center(
-            child: Text(
-              "Sign up to send alerts and stay protected\n anytime",
-              style: TextStyle(fontSize: 16),
-            ),
-          ),
-          SizedBox(height: 20),
-          Form(
-            key: _formKey,
-            child: Column(
+            
+            const SizedBox(height: 10),
+            
+            Row(
               children: [
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  child: TextFormField(
-                    controller: usernameController,
-                    decoration: InputDecoration(
-                      labelText: "User Name",
-                      hintText: "username",
-                      prefixIcon: Icon(Icons.person, color: Colors.grey),
-                      hintStyle: TextStyle(color: Colors.grey),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                    ),
-                    validator: (value) {
-                      if (value == null || value.isEmpty) {
-                        return "Enter Your UserName ";
-                      }
-                      if (value.length < 3) {
-                        return " username must be at least 3 characters";
-                      }
-                      return null;
-                    },
-                  ),
-                ),
-                SizedBox(height: 10,),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal:10),
-                  child: TextFormField(
-                    controller: _emailController,
-                    decoration: InputDecoration(
-                      labelText: 'Email',
-                      hintText: 'Enter Email',
-                      hintStyle: TextStyle(color: Colors.grey),
-                      prefixIcon: Icon(Icons.email,color: Colors.grey,),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                    ),
-                    validator: (value){
-                      if (value == null || value.isEmpty){
-                        return 'Enter your email';
-                      }
-                      if (!value.contains('@')){
-                        return 'return valid email';
-                      }
-                      return null;
-                    },
-                  ),
-                ),
-                SizedBox(height: 10),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  child: TextFormField(
-                    obscureText: _obscurePassword,
-                    controller: _passwordController,
-                    textInputAction: TextInputAction.next,
-                    decoration: InputDecoration(
-                      hintText: "Password",
-                      labelText: "Password",
-                      suffixIcon: IconButton(
-                        onPressed: () {
-                          setState(() {
-                            _obscurePassword = !_obscurePassword;
-                          });
-                        },
-                        icon: Icon(
-                          _obscurePassword
-                              ? Icons.visibility_off
-                              : Icons.visibility,
-                        ),
-                      ),
-                      prefixIcon: Icon(Icons.lock, color: Colors.grey),
-                      hintStyle: TextStyle(color: Colors.grey),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                    ),
-                    validator: (value){
-                      if (value == null || value.isEmpty){
-                        return 'Choose your password';
-                      }
-                      if (value.length<8){
-                        return 'Choose minimum 8 characters passwords';
-                      }
-                      return null;
-                    },
-                  ),
+                Checkbox(value: _agreeToTerms, onChanged: (v) => setState(() => _agreeToTerms = v ?? false)),
+                const Text("I Agree to your "),
+                GestureDetector(
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const PrivacyTerm())),
+                  child: const Text("Privacy Policy & Terms", style: TextStyle(fontWeight: FontWeight.bold, decoration: TextDecoration.underline)),
                 ),
               ],
             ),
-          ),
-          SizedBox(height: 02),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.start,
-            children: [
-              Checkbox(
-                value: _rememberMe,
-                onChanged: (value) {
-                  setState(() {
-                    _rememberMe = value ?? false;
-                  });
-                },
-              ),
-
-              Text("I Agree to your"),
-              SizedBox(width: 5),
-              InkWell(
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) {
-                        return PrivacyTerm();
-                      },
-                    ),
-                  );
-                },
-
-                child: Text(
-                  "Privacy Policy & Terms",
-                  style: TextStyle(
-                    color: Colors.black,
-                    fontWeight: FontWeight.bold,
-                    decoration: TextDecoration.underline,
+            
+            const SizedBox(height: 30),
+            
+            _isLoading 
+              ? const CircularProgressIndicator()
+              : ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    padding: EdgeInsets.zero,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
                   ),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: 10),
-          SizedBox(
-            height: 50,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              child: InkWell(
-                onTap: () async {
-                  if (_formKey.currentState!.validate()) {
-                    try {
-                        UserCredential userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
-                          email: _emailController.text.trim(),
-                          password: _passwordController.text.trim(),
-                        );
-                        
-                        // Create user document in Firestore
-                        await FirebaseFirestore.instance.collection('users').doc(userCredential.user!.uid).set({
-                          'uid': userCredential.user!.uid,
-                          'email': _emailController.text.trim().toLowerCase(),
-                          'username': usernameController.text.trim(),
-                          'createdAt': FieldValue.serverTimestamp(),
-                        });
-
-                        if (context.mounted) {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (context) {
-                              return NamePage();
-                            },
-                          ),
-                        );
-                      }
-                    } on FirebaseAuthException catch (e) {
-                      String message = "An error occurred";
-                      if (e.code == 'weak-password') {
-                        message = 'The password provided is too weak.';
-                      } else if (e.code == 'email-already-in-use') {
-                        // User might have started signup but not finished. Try to sign in.
-                        try {
-                          UserCredential userCredential = await FirebaseAuth.instance.signInWithEmailAndPassword(
-                            email: _emailController.text.trim(),
-                            password: _passwordController.text.trim(),
-                          );
-                          
-                          // Ensure Firestore document exists
-                          await FirebaseFirestore.instance.collection('users').doc(userCredential.user!.uid).set({
-                            'uid': userCredential.user!.uid,
-                            'email': _emailController.text.trim().toLowerCase(),
-                            'username': usernameController.text.trim(),
-                            'createdAt': FieldValue.serverTimestamp(),
-                          }, SetOptions(merge: true));
-
-                          if (context.mounted) {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(builder: (context) => NamePage()),
-                            );
-                          }
-                          return; // Success, exit the outer try-catch
-                        } catch (signInError) {
-                          message = 'The account already exists for that email. Check your password.';
-                        }
-                      } else if (e.code == 'invalid-email') {
-                         message = 'The email address is invalid.';
-                      }
-                      if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text(message)),
-                        );
-                      }
-                    } catch (e) {
-                      if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text("Error: ${e.toString()}")),
-                        );
-                      }
-                    }
-                  }
-                },
-                child: Container(
-                  height: 60,
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [Color(0xff250D57), Color(0xff38B6FF)],
+                  onPressed: _handleSignUp,
+                  child: Ink(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(colors: [themeColor, accentColor]),
+                      borderRadius: BorderRadius.circular(25),
                     ),
-                    borderRadius: BorderRadius.circular(30),
-                  ),
-                  child: Center(
-                    child: Text(
-                      "Get Started",
-                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    child: Container(
+                      height: 55,
+                      alignment: Alignment.center,
+                      child: const Text("GET STARTED", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
                     ),
                   ),
                 ),
-              ),
+            
+            const SizedBox(height: 25),
+            
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Text("Already have an account?"),
+                TextButton(
+                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LoginPage())),
+                  child: const Text("Sign In", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                ),
+              ],
             ),
-          ),
-          SizedBox(height: 20),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text("Already have account"),
-              SizedBox(width: 10),
-              InkWell(
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) {
-                        return LoginPage();
-                      },
-                    ),
-                  );
-                },
-                child: Text(
-                  "Sign IN",
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    decoration: TextDecoration.underline,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: 30),
-        ],
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextField(TextEditingController controller, String label, IconData icon, {bool isPassword = false, bool isEmail = false, bool obscure = false, VoidCallback? onToggle}) {
+    return TextFormField(
+      controller: controller,
+      obscureText: obscure,
+      keyboardType: isEmail ? TextInputType.emailAddress : TextInputType.text,
+      validator: (value) {
+        if (value == null || value.isEmpty) return "Please enter your $label";
+        if (isEmail && !value.contains('@')) return "Enter a valid email";
+        if (isPassword && value.length < 6) return "Password must be at least 6 characters";
+        return null;
+      },
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon, color: Colors.grey),
+        suffixIcon: isPassword 
+            ? IconButton(icon: Icon(obscure ? Icons.visibility_off : Icons.visibility, color: Colors.grey), onPressed: onToggle)
+            : null,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
+        contentPadding: const EdgeInsets.symmetric(vertical: 18),
       ),
     );
   }

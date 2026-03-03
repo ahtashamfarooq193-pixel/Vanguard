@@ -1,21 +1,21 @@
 {
   "project_info": {
-    "project_number": "757008278850",
-    "project_id": "chatbot-3bf73",
-    "storage_bucket": "chatbot-3bf73.firebasestorage.app"
+    "project_number": "333649916617",
+    "project_id": "emergency-alert-9cff6",
+    "storage_bucket": "emergency-alert-9cff6.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:757008278850:android:499f984ab5aed817d1d4db",
+        "mobilesdk_app_id": "1:333649916617:android:59bc3fea3ceee6b2ca5318",
         "android_client_info": {
-          "package_name": "com.example.my_app1"
+          "package_name": "com.shamii.vanguard"
         }
       },
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyDdVA2vCd0DE1M7J_GkwPbSa-2F0dRbWlY"
+          "current_key": "AIzaSyDHoXNREmWLBmRct7GI_4lPpzGXT2QZ5VA"
         }
       ],
       "services": {
