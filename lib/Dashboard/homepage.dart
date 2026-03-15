@@ -14,6 +14,8 @@ import 'package:my_app1/Dashboard/notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:my_app1/services/fcm_service.dart';
+import 'package:my_app1/services/agora_service.dart';
+import 'package:my_app1/Dashboard/call_screen.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -43,7 +45,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
     
     final uid = _auth.currentUser?.uid;
-    if (uid != null) PresenceService.setOnline(uid);
+    if (uid != null) {
+      PresenceService.setOnline(uid);
+      _listenForCalls(uid);
+    }
+  }
+
+  StreamSubscription? _callSub;
+  void _listenForCalls(String uid) {
+    AgoraService.init();
+    _callSub = AgoraService.watchIncomingCall(uid).listen((event) {
+      if (!mounted) return;
+      final val = event.snapshot.value;
+      if (val is Map && val['status'] == 'ringing') {
+        // Prevent multiple screens if already on a call screen or similar
+        // For now, simple push
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => IncomingCallScreen(
+              callerName: val['callerName'] ?? 'Unknown Caller',
+              callerPhoto: val['callerPhoto'] ?? '',
+              callId: val['callId'],
+              callerId: val['callerId'],
+              myId: uid,
+              isVideo: val['isVideo'] == true,
+            ),
+          ),
+        );
+      }
+    });
   }
 
   @override
@@ -57,6 +88,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _positionStreamSubscription?.cancel();
+    _callSub?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -530,75 +562,196 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               const SizedBox(height: 25),
 
               // ── CONTACTS HEADER ──
-              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                const Text('Emergency Contacts', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                IconButton(icon: const Icon(Icons.add_circle_outline, color: Color(0xff38B6FF), size: 28), onPressed: _addContact),
-              ]),
+              StreamBuilder<QuerySnapshot>(
+                stream: _firestore.collection('users').doc(uid).collection('contacts').snapshots(),
+                builder: (context, snapshot) {
+                  final docs = snapshot.data?.docs ?? [];
+                  final atLimit = docs.length >= 10;
+                  return Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'Emergency Contacts (${docs.length}/10)',
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          Icons.add_circle_outline,
+                          color: atLimit ? Colors.grey : const Color(0xff38B6FF),
+                          size: 28,
+                        ),
+                        onPressed: atLimit
+                            ? () => ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Maximum 10 emergency contacts allowed.'),
+                                    backgroundColor: Colors.orange,
+                                  ),
+                                )
+                            : _addContact,
+                      ),
+                    ],
+                  );
+                },
+              ),
 
-              // ── CONTACTS LIST (LIVE StreamBuilder) ──
+              // ── CONTACTS LIST — HORIZONTAL SCROLL ──
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.all(15),
+                padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
                 decoration: BoxDecoration(
-                  color: Colors.white, borderRadius: BorderRadius.circular(20),
-                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 4))],
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.04),
+                      blurRadius: 10,
+                      offset: const Offset(0, 4),
+                    )
+                  ],
                 ),
                 child: StreamBuilder<QuerySnapshot>(
                   stream: _firestore.collection('users').doc(uid).collection('contacts').snapshots(),
                   builder: (context, snapshot) {
                     if (snapshot.connectionState == ConnectionState.waiting) {
-                      return const Center(child: Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator()));
+                      return const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(20),
+                          child: CircularProgressIndicator(),
+                        ),
+                      );
                     }
                     if (snapshot.hasError) {
-                      debugPrint('❌ Firestore Error: ${snapshot.error}');
-                      return Center(child: Padding(padding: const EdgeInsets.all(20), child: Text('Firestore error. Please check setup.', style: const TextStyle(color: Colors.red, fontSize: 12))));
-                    }
-                    final docs = snapshot.data?.docs ?? [];
-                    if (docs.isEmpty) {
                       return const Center(
-                        child: Padding(padding: EdgeInsets.all(25),
+                        child: Padding(
+                          padding: EdgeInsets.all(20),
+                          child: Text(
+                            'Firestore error. Please check setup.',
+                            style: TextStyle(color: Colors.red, fontSize: 12),
+                          ),
+                        ),
+                      );
+                    }
+
+                    // Limit to max 10 contacts
+                    final allDocs = snapshot.data?.docs ?? [];
+                    final docs = allDocs.take(10).toList();
+
+                    if (docs.isEmpty) {
+                      return const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 18),
+                        child: Center(
                           child: Column(mainAxisSize: MainAxisSize.min, children: [
                             Icon(Icons.people_outline, size: 40, color: Colors.grey),
                             SizedBox(height: 10),
-                            Text('No contacts added yet.\nTap + to add.', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)),
+                            Text(
+                              'No contacts added yet.\nTap + to add.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.grey),
+                            ),
                           ]),
                         ),
                       );
                     }
-                    return Column(
-                      children: docs.map((doc) {
-                        final d = doc.data() as Map<String, dynamic>;
-                        final contactUid = d['uid'] ?? doc.id;
-                        final nameFromDoc = d['name'] ?? 'Unknown';
 
-                        return StreamBuilder<DocumentSnapshot>(
-                          stream: _firestore.collection('users').doc(contactUid).snapshots(),
-                          builder: (context, userSnap) {
-                            String? pUrl;
-                            String name = nameFromDoc;
-                            if (userSnap.hasData && userSnap.data!.exists) {
-                              final uData = userSnap.data!.data() as Map<String, dynamic>;
-                              pUrl = uData['photoUrl'];
-                              name = uData['name'] ?? name;
-                            }
+                    // ── HORIZONTAL SCROLL ROW ──
+                    return SizedBox(
+                      height: 100,
+                      child: ListView.builder(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: docs.length,
+                        itemBuilder: (context, index) {
+                          final doc = docs[index];
+                          final d = doc.data() as Map<String, dynamic>;
+                          final contactUid = d['uid'] ?? doc.id;
+                          final nameFromDoc = d['name'] ?? 'Unknown';
 
-                            return ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: CircleAvatar(
-                                backgroundColor: const Color(0xffF1F2F6),
-                                backgroundImage: pUrl != null ? NetworkImage(pUrl) : null,
-                                child: pUrl == null ? Text(name[0].toUpperCase(), style: const TextStyle(color: Color(0xff250D57), fontWeight: FontWeight.bold)) : null,
-                              ),
-                              title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                              subtitle: Text(d['contact'] ?? '', style: const TextStyle(color: Colors.grey, fontSize: 13)),
-                              trailing: IconButton(
-                                icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
-                                onPressed: () => _removeContact(doc.id, name),
-                              ),
-                            );
-                          },
-                        );
-                      }).toList(),
+                          return StreamBuilder<DocumentSnapshot>(
+                            stream: _firestore
+                                .collection('users')
+                                .doc(contactUid)
+                                .snapshots(),
+                            builder: (context, userSnap) {
+                              String? pUrl;
+                              String name = nameFromDoc;
+                              if (userSnap.hasData && userSnap.data!.exists) {
+                                final uData = userSnap.data!.data()
+                                    as Map<String, dynamic>;
+                                pUrl = uData['photoUrl'];
+                                name = uData['name'] ?? name;
+                              }
+                              final firstName = name.split(' ').first;
+
+                              return GestureDetector(
+                                onLongPress: () => _removeContact(doc.id, name),
+                                child: Container(
+                                  width: 72,
+                                  margin: const EdgeInsets.symmetric(horizontal: 6),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Stack(
+                                        children: [
+                                          CircleAvatar(
+                                            radius: 28,
+                                            backgroundColor:
+                                                const Color(0xffF1F2F6),
+                                            backgroundImage: pUrl != null
+                                                ? NetworkImage(pUrl)
+                                                : null,
+                                            child: pUrl == null
+                                                ? Text(
+                                                    name[0].toUpperCase(),
+                                                    style: const TextStyle(
+                                                      color: Color(0xff250D57),
+                                                      fontWeight: FontWeight.bold,
+                                                      fontSize: 18,
+                                                    ),
+                                                  )
+                                                : null,
+                                          ),
+                                          // Delete badge
+                                          Positioned(
+                                            top: 0,
+                                            right: 0,
+                                            child: GestureDetector(
+                                              onTap: () =>
+                                                  _removeContact(doc.id, name),
+                                              child: Container(
+                                                height: 18,
+                                                width: 18,
+                                                decoration: const BoxDecoration(
+                                                  color: Colors.redAccent,
+                                                  shape: BoxShape.circle,
+                                                ),
+                                                child: const Icon(
+                                                  Icons.close,
+                                                  color: Colors.white,
+                                                  size: 12,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        firstName,
+                                        style: const TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                          color: Color(0xff2D3142),
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                        textAlign: TextAlign.center,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
                     );
                   },
                 ),

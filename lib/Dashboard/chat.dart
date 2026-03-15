@@ -10,6 +10,8 @@ import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:my_app1/services/cloudinary_service.dart';
 import 'package:my_app1/services/fcm_service.dart';
+import 'package:my_app1/services/agora_service.dart';
+import 'package:my_app1/Dashboard/call_screen.dart';
 import 'package:my_app1/bottombar.dart';
 import 'package:my_app1/Dashboard/homepage.dart';
 import 'package:my_app1/Dashboard/location.dart';
@@ -161,7 +163,11 @@ class _ChatSelectionScreenState extends State<ChatSelectionScreen> {
         elevation: 0,
         title: const Text('Vanguard Chat', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
         actions: [
-          IconButton(icon: const Icon(Icons.search, color: Colors.white70), onPressed: () {}),
+          IconButton(
+            icon: const Icon(Icons.person_add_alt_1, color: Colors.white70),
+            tooltip: 'Search & Add User',
+            onPressed: _showUserSearchDialog,
+          ),
         ],
       ),
       body: Column(
@@ -302,6 +308,7 @@ class _ChatSelectionScreenState extends State<ChatSelectionScreen> {
                                       time: time,
                                       unread: unread,
                                       photoUrl: photoUrl.isNotEmpty ? photoUrl : null,
+                                      friendId: doc.id,
                                       onTap: () => Navigator.push(context, MaterialPageRoute(
                                         builder: (_) => Chat(chatType: 'friend', friendName: name, friendId: doc.id),
                                       )),
@@ -622,25 +629,78 @@ class _ChatSelectionScreenState extends State<ChatSelectionScreen> {
     );
   }
 
-  Widget _chatTile({required String title, required String subtitle, bool isAi = false, String? time, int unread = 0, String? photoUrl, required VoidCallback onTap}) {
+  Widget _chatTile({
+    required String title,
+    required String subtitle,
+    bool isAi = false,
+    String? time,
+    int unread = 0,
+    String? photoUrl,
+    String? friendId,
+    required VoidCallback onTap,
+  }) {
+    // For non-AI tiles, watch real-time presence from Firebase
+    if (!isAi && friendId != null) {
+      return StreamBuilder<DatabaseEvent>(
+        stream: _db.ref('presence/$friendId').onValue,
+        builder: (context, presSnap) {
+          bool isOnline = false;
+          if (presSnap.hasData && presSnap.data!.snapshot.value != null) {
+            final val = presSnap.data!.snapshot.value;
+            if (val is Map) isOnline = val['online'] == true;
+          }
+          return _buildTileWidget(
+            title: title, subtitle: subtitle, isAi: false, time: time,
+            unread: unread, photoUrl: photoUrl, isOnline: isOnline, onTap: onTap,
+          );
+        },
+      );
+    }
+    return _buildTileWidget(
+      title: title, subtitle: subtitle, isAi: isAi, time: time,
+      unread: unread, photoUrl: photoUrl, isOnline: false, onTap: onTap,
+    );
+  }
+
+  Widget _buildTileWidget({
+    required String title,
+    required String subtitle,
+    bool isAi = false,
+    String? time,
+    int unread = 0,
+    String? photoUrl,
+    bool isOnline = false,
+    required VoidCallback onTap,
+  }) {
     return ListTile(
       onTap: onTap,
       contentPadding: const EdgeInsets.symmetric(horizontal: 25, vertical: 8),
       leading: Stack(children: [
-      GestureDetector(
-        onTap: () { if (photoUrl != null) _showFullImage(context, photoUrl); },
-        child: Container(
-          height: 60, width: 60,
-          decoration: BoxDecoration(
-            gradient: isAi ? const LinearGradient(colors: [Color(0xff250D57), Color(0xff38B6FF)]) : null,
-            color: isAi ? null : const Color(0xffF0F2F5),
-            borderRadius: BorderRadius.circular(20)),
-          child: photoUrl != null 
-            ? ClipRRect(borderRadius: BorderRadius.circular(20), child: Image.network(photoUrl, fit: BoxFit.cover, errorBuilder: (_, __, ___) => Icon(isAi ? Icons.auto_awesome : Icons.person, color: isAi ? Colors.white : const Color(0xff250D57), size: 30)))
-            : Icon(isAi ? Icons.auto_awesome : Icons.person, color: isAi ? Colors.white : const Color(0xff250D57), size: 30)),
-      ),
-      if (!isAi)
-          Positioned(bottom: 2, right: 2, child: Container(height: 14, width: 14, decoration: BoxDecoration(color: Colors.green, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)))),
+        GestureDetector(
+          onTap: () { if (photoUrl != null) _showFullImage(context, photoUrl); },
+          child: Container(
+            height: 60, width: 60,
+            decoration: BoxDecoration(
+              gradient: isAi ? const LinearGradient(colors: [Color(0xff250D57), Color(0xff38B6FF)]) : null,
+              color: isAi ? null : const Color(0xffF0F2F5),
+              borderRadius: BorderRadius.circular(20)),
+            child: photoUrl != null
+              ? ClipRRect(borderRadius: BorderRadius.circular(20), child: Image.network(photoUrl, fit: BoxFit.cover, errorBuilder: (_, __, ___) => Icon(isAi ? Icons.auto_awesome : Icons.person, color: isAi ? Colors.white : const Color(0xff250D57), size: 30)))
+              : Icon(isAi ? Icons.auto_awesome : Icons.person, color: isAi ? Colors.white : const Color(0xff250D57), size: 30)),
+        ),
+        // ✅ Only show green dot when actually online
+        if (!isAi)
+          Positioned(
+            bottom: 2, right: 2,
+            child: Container(
+              height: 14, width: 14,
+              decoration: BoxDecoration(
+                color: isOnline ? Colors.green : Colors.grey,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 2),
+              ),
+            ),
+          ),
       ]),
       title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17, color: Color(0xff250D57))),
       subtitle: Text(subtitle, style: TextStyle(color: unread > 0 ? const Color(0xff250D57) : Colors.grey, fontSize: 14, fontWeight: unread > 0 ? FontWeight.w600 : FontWeight.normal)),
@@ -653,12 +713,224 @@ class _ChatSelectionScreenState extends State<ChatSelectionScreen> {
     );
   }
 
+  // ════════════════════════════════════════════════════════════════
+  //  USER SEARCH & ADD CONTACT DIALOG
+  // ════════════════════════════════════════════════════════════════
+  void _showUserSearchDialog() {
+    final searchCtrl = TextEditingController();
+    List<Map<String, dynamic>> results = [];
+    bool isSearching = false;
+    final myUid = _auth.currentUser?.uid ?? '';
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          Future<void> doSearch(String query) async {
+            if (query.trim().isEmpty) {
+              setDlgState(() { results = []; isSearching = false; });
+              return;
+            }
+            setDlgState(() => isSearching = true);
+
+            // Search by name (case-insensitive via prefix range trick)
+            final q = query.trim().toLowerCase();
+            final byName = await _firestore
+                .collection('users')
+                .get();
+
+            final found = byName.docs
+                .where((d) {
+                  final data = d.data();
+                  final name = (data['name'] ?? data['displayName'] ?? '').toString().toLowerCase();
+                  final email = (data['email'] ?? '').toString().toLowerCase();
+                  return d.id != myUid && (name.contains(q) || email.contains(q));
+                })
+                .map((d) {
+                  final data = d.data();
+                  return {
+                    'uid': d.id,
+                    'name': data['name'] ?? data['displayName'] ?? 'Unknown',
+                    'email': data['email'] ?? '',
+                    'photoUrl': data['photoUrl'] ?? '',
+                  };
+                })
+                .toList();
+
+            setDlgState(() { results = found; isSearching = false; });
+          }
+
+          Future<void> addContact(Map<String, dynamic> user) async {
+            try {
+              // Add to my contacts
+              await _firestore
+                  .collection('users')
+                  .doc(myUid)
+                  .collection('contacts')
+                  .doc(user['uid'])
+                  .set({'name': user['name'], 'email': user['email'], 'addedAt': FieldValue.serverTimestamp()});
+              // Add me to their contacts too (mutual)
+              final myData = await _firestore.collection('users').doc(myUid).get();
+              final myName = myData.data()?['name'] ?? myData.data()?['displayName'] ?? 'User';
+              final myEmail = myData.data()?['email'] ?? '';
+              await _firestore
+                  .collection('users')
+                  .doc(user['uid'])
+                  .collection('contacts')
+                  .doc(myUid)
+                  .set({'name': myName, 'email': myEmail, 'addedAt': FieldValue.serverTimestamp()});
+
+              if (mounted) {
+                Navigator.pop(ctx);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('${user['name']} ko add kar diya! ✅'),
+                    backgroundColor: const Color(0xff250D57),
+                  ),
+                );
+              }
+            } catch (e) {
+              if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+            }
+          }
+
+          return Dialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+            insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 40),
+            child: Container(
+              width: double.infinity,
+              constraints: const BoxConstraints(maxHeight: 520),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Header
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(colors: [Color(0xff250D57), Color(0xff38B6FF)]),
+                      borderRadius: BorderRadius.only(topLeft: Radius.circular(24), topRight: Radius.circular(24)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.person_search, color: Colors.white, size: 26),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Text('User Dhundho & Add Karo', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white70),
+                          onPressed: () => Navigator.pop(ctx),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Search field
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                    child: TextField(
+                      controller: searchCtrl,
+                      autofocus: true,
+                      decoration: InputDecoration(
+                        hintText: 'Naam ya email likho...',
+                        prefixIcon: const Icon(Icons.search, color: Color(0xff250D57)),
+                        suffixIcon: isSearching
+                            ? const Padding(padding: EdgeInsets.all(12), child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)))
+                            : null,
+                        filled: true,
+                        fillColor: const Color(0xffF0F2F5),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+                        contentPadding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onChanged: (v) => doSearch(v),
+                    ),
+                  ),
+                  // Results
+                  Flexible(
+                    child: results.isEmpty && !isSearching
+                        ? Padding(
+                            padding: const EdgeInsets.all(30),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.people_outline, size: 60, color: Colors.grey[300]),
+                                const SizedBox(height: 12),
+                                Text(
+                                  searchCtrl.text.isEmpty ? 'Naam ya email type karo' : 'Koi user nahi mila',
+                                  style: const TextStyle(color: Colors.grey, fontSize: 14),
+                                ),
+                              ],
+                            ),
+                          )
+                        : ListView.separated(
+                            shrinkWrap: true,
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                            itemCount: results.length,
+                            separatorBuilder: (_, __) => const Divider(height: 1),
+                            itemBuilder: (_, i) {
+                              final u = results[i];
+                              return FutureBuilder<DocumentSnapshot>(
+                                future: _firestore.collection('users').doc(myUid).collection('contacts').doc(u['uid']).get(),
+                                builder: (_, snap) {
+                                  final alreadyAdded = snap.data?.exists == true;
+                                  return ListTile(
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                                    leading: CircleAvatar(
+                                      radius: 24,
+                                      backgroundColor: const Color(0xff250D57).withOpacity(0.1),
+                                      backgroundImage: u['photoUrl'].isNotEmpty ? NetworkImage(u['photoUrl']) : null,
+                                      child: u['photoUrl'].isEmpty ? const Icon(Icons.person, color: Color(0xff250D57)) : null,
+                                    ),
+                                    title: Text(u['name'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Color(0xff250D57))),
+                                    subtitle: Text(u['email'], style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                                    trailing: alreadyAdded
+                                        ? Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                            decoration: BoxDecoration(
+                                              color: Colors.green.withOpacity(0.1),
+                                              borderRadius: BorderRadius.circular(20),
+                                              border: Border.all(color: Colors.green),
+                                            ),
+                                            child: const Text('Added ✓', style: TextStyle(color: Colors.green, fontSize: 12, fontWeight: FontWeight.bold)),
+                                          )
+                                        : ElevatedButton.icon(
+                                            icon: const Icon(Icons.person_add, size: 16),
+                                            label: const Text('Add', style: TextStyle(fontSize: 13)),
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: const Color(0xff250D57),
+                                              foregroundColor: Colors.white,
+                                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                            ),
+                                            onPressed: () => addContact(u),
+                                          ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _emptyState() => Padding(
     padding: const EdgeInsets.only(top: 50),
     child: Column(children: [
       Icon(Icons.chat_bubble_outline, size: 80, color: Colors.grey[300]),
       const SizedBox(height: 20),
-      const Text('Add contacts on Home to chat', style: TextStyle(color: Colors.grey, fontSize: 14)),
+      const Text('Upar se user dhundh kar add karo!', style: TextStyle(color: Colors.grey, fontSize: 14)),
     ]),
   );
 }
@@ -941,6 +1213,48 @@ class _ChatState extends State<Chat> with WidgetsBindingObserver {
     });
   }
 
+  // ── START A CALL ──
+  Future<void> _startCall({required bool isVideo}) async {
+    if (widget.chatType == 'ai') return;
+    final user = _auth.currentUser;
+    if (user == null) return;
+
+    // Get my profile photo
+    final myDoc = await _firestore.collection('users').doc(_myId).get();
+    final myPhoto = myDoc.data()?['photoUrl'] ?? '';
+    final myName = user.displayName ?? 'User';
+
+    // callId = chatId (unique for this pair)
+    final callId = _chatId;
+
+    // Send invite to friend via Firebase RTDB
+    AgoraService.init();
+    await AgoraService.sendCallInvite(
+      callId: callId,
+      callerId: _myId,
+      callerName: myName,
+      callerPhoto: myPhoto,
+      receiverId: widget.friendId,
+      isVideo: isVideo,
+    );
+
+    // Navigate to call screen
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AgoraCallScreen(
+          channelName: callId,
+          friendName: widget.friendName ?? 'Friend',
+          friendPhoto: '',
+          friendId: widget.friendId,
+          isVideo: isVideo,
+          isCaller: true,
+        ),
+      ),
+    );
+  }
+
   // ── BUILD ──
   @override
   Widget build(BuildContext context) {
@@ -984,9 +1298,17 @@ class _ChatState extends State<Chat> with WidgetsBindingObserver {
               ),
           ]),
         ]),
-        actions: [
-          IconButton(icon: const Icon(Icons.call, color: theme, size: 22), onPressed: () {}),
-          IconButton(icon: const Icon(Icons.videocam, color: theme, size: 22), onPressed: () {}),
+        actions: widget.chatType == 'ai' ? [] : [
+          // Voice Call
+          IconButton(
+            icon: const Icon(Icons.phone, color: theme, size: 22),
+            onPressed: () => _startCall(isVideo: false),
+          ),
+          // Video Call
+          IconButton(
+            icon: const Icon(Icons.videocam, color: theme, size: 26),
+            onPressed: () => _startCall(isVideo: true),
+          ),
         ],
       ),
       body: Column(

@@ -54,6 +54,8 @@ dependencies:
   url_launcher: ^6.3.2
   video_player: ^2.11.0
   package_info_plus: ^9.0.0
+  agora_rtc_engine: ^6.5.3
+  permission_handler: ^11.3.1
 
 
 
