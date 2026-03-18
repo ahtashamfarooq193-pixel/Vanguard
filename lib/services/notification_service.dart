@@ -7,6 +7,9 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:my_app1/main.dart';
+import 'package:my_app1/Dashboard/call_screen.dart';
+import 'package:my_app1/services/agora_service.dart';
 
 // Top-level handler for background/terminated messages
 // Must be a top-level function with @pragma to run in a separate isolate
@@ -80,6 +83,13 @@ class NotificationService {
 
     // 5. Foreground messages → show local notification
     FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      // 🚨 FIX: Don't show redundant local notification if it's a chat message 
+      // (already handled by startGlobalChatListener)
+      if (message.data['type'] == 'chat_message') {
+        debugPrint('FCM: Chat message received in foreground, ignoring as RTDB listener will handle it.');
+        return;
+      }
+      
       if (message.notification != null) {
         _showLocal(
           title: message.notification!.title ?? 'Vanguard',
@@ -151,9 +161,10 @@ class NotificationService {
   static final Map<String, int> _lastNotifiedTimestamps = {};
   static StreamSubscription? _alertSub;
   static StreamSubscription? _contactSub;
+  static StreamSubscription? _callSub;
+  static String? _lastCallId;
 
-  /// Keep listening to all chats the user is part of while the app is in the foreground.
-  /// This bridges the gap for immediate local notifications if Cloud Functions are delayed/not deployed.
+  /// Keep listening to all chats and CALLS globally
   static void startGlobalChatListener() {
     final auth = FirebaseAuth.instance;
     final firestore = FirebaseFirestore.instance;
@@ -167,6 +178,7 @@ class NotificationService {
       // Clear previous subscriptions when auth state changes
       _contactSub?.cancel();
       _alertSub?.cancel();
+      _callSub?.cancel();
       for (var sub in _chatSubs.values) {
         sub.cancel();
       }
@@ -174,6 +186,30 @@ class NotificationService {
 
       if (user == null) return;
       final uid = user.uid;
+
+      // ── GLOBAL CALL LISTENER ──
+      _callSub = db.ref('calls/$uid').onValue.listen((event) {
+        final val = event.snapshot.value;
+        if (val is Map && val['status'] == 'ringing') {
+          final callId = val['callId']?.toString();
+          if (_lastCallId == callId) return; // Already showing this call
+          _lastCallId = callId;
+
+          // Navigate to incoming call screen via global key
+          MyApp.navigatorKey.currentState?.push(
+            MaterialPageRoute(
+              builder: (_) => IncomingCallScreen(
+                callerName: val['callerName'] ?? 'Unknown Caller',
+                callerPhoto: val['callerPhoto'] ?? '',
+                callId: val['callId'],
+                callerId: val['callerId'],
+                myId: uid,
+                isVideo: val['isVideo'] == true,
+              ),
+            ),
+          ).then((_) => _lastCallId = null); // Reset when screen is closed
+        }
+      });
 
       // Stream all emergency contacts to dynamically form Chat IDs
       _contactSub = firestore.collection('users').doc(uid).collection('contacts').snapshots().listen((snap) {
@@ -195,6 +231,14 @@ class NotificationService {
 
                 // If I am NOT the sender, and the message hasn't been seen yet
                 if (senderId != uid && status != 'seen') {
+                  
+                  // ✅ FEATURE: Active "Delivered" status update
+                  // If status is 'sent', update to 'delivered' as it has reached my listener
+                  if (status == 'sent') {
+                     db.ref('chats/$chatId/messages/${event.snapshot.key}/status').set('delivered');
+                     db.ref('chats/$chatId/lastMessage/status').set('delivered');
+                  }
+
                   // Prevent duplicate notifications caused by state bumps for the exact same message
                   if (_lastNotifiedTimestamps[chatId] != timestamp) {
                     _lastNotifiedTimestamps[chatId] = timestamp;

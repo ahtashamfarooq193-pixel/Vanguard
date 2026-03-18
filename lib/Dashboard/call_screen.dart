@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:agora_rtc_engine/agora_rtc_engine.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:my_app1/services/agora_service.dart';
@@ -447,7 +448,7 @@ class _AgoraCallScreenState extends State<AgoraCallScreen>
 // ════════════════════════════════════════════════════════════════
 //  INCOMING CALL SCREEN — shown when someone calls you
 // ════════════════════════════════════════════════════════════════
-class IncomingCallScreen extends StatelessWidget {
+class IncomingCallScreen extends StatefulWidget {
   final String callerName;
   final String callerPhoto;
   final String callId;
@@ -464,6 +465,28 @@ class IncomingCallScreen extends StatelessWidget {
     required this.myId,
     required this.isVideo,
   });
+
+  @override
+  State<IncomingCallScreen> createState() => _IncomingCallScreenState();
+}
+
+class _IncomingCallScreenState extends State<IncomingCallScreen> {
+  Timer? _vibrateTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Start vibration loop for ringing effect
+    _vibrateTimer = Timer.periodic(const Duration(milliseconds: 1200), (timer) {
+      HapticFeedback.vibrate();
+    });
+  }
+
+  @override
+  void dispose() {
+    _vibrateTimer?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -493,12 +516,12 @@ class IncomingCallScreen extends StatelessWidget {
                 child: CircleAvatar(
                   radius: 65,
                   backgroundColor: Colors.white10,
-                  backgroundImage: callerPhoto.isNotEmpty
-                      ? NetworkImage(callerPhoto)
+                  backgroundImage: widget.callerPhoto.isNotEmpty
+                      ? NetworkImage(widget.callerPhoto)
                       : null,
-                  child: callerPhoto.isEmpty
+                  child: widget.callerPhoto.isEmpty
                       ? Text(
-                          callerName[0].toUpperCase(),
+                          widget.callerName[0].toUpperCase(),
                           style: const TextStyle(
                               color: Colors.white,
                               fontSize: 50,
@@ -510,7 +533,9 @@ class IncomingCallScreen extends StatelessWidget {
             ),
             const SizedBox(height: 30),
             Text(
-              callerName,
+              widget.callerName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                   color: Colors.white,
                   fontSize: 30,
@@ -521,13 +546,13 @@ class IncomingCallScreen extends StatelessWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Icon(
-                  isVideo ? Icons.videocam : Icons.phone,
+                  widget.isVideo ? Icons.videocam : Icons.phone,
                   color: Colors.white60,
                   size: 18,
                 ),
                 const SizedBox(width: 6),
                 Text(
-                  isVideo ? 'Incoming Video Call' : 'Incoming Voice Call',
+                  widget.isVideo ? 'Incoming Video Call' : 'Incoming Voice Call',
                   style: const TextStyle(color: Colors.white60, fontSize: 16),
                 ),
               ],
@@ -544,8 +569,8 @@ class IncomingCallScreen extends StatelessWidget {
                     children: [
                       GestureDetector(
                         onTap: () async {
-                          await AgoraService.rejectCall(myId);
-                          if (context.mounted) Navigator.pop(context);
+                          await AgoraService.rejectCall(widget.myId);
+                          if (mounted) Navigator.pop(context);
                         },
                         child: Container(
                           width: 70,
@@ -568,17 +593,17 @@ class IncomingCallScreen extends StatelessWidget {
                     children: [
                       GestureDetector(
                         onTap: () async {
-                          await AgoraService.acceptCall(myId);
-                          if (context.mounted) {
+                          await AgoraService.acceptCall(widget.myId);
+                          if (mounted) {
                             Navigator.pushReplacement(
                               context,
                               MaterialPageRoute(
                                 builder: (_) => AgoraCallScreen(
-                                  channelName: callId,
-                                  friendName: callerName,
-                                  friendPhoto: callerPhoto,
-                                  friendId: callerId,
-                                  isVideo: isVideo,
+                                  channelName: widget.callId,
+                                  friendName: widget.callerName,
+                                  friendPhoto: widget.callerPhoto,
+                                  friendId: widget.callerId,
+                                  isVideo: widget.isVideo,
                                   isCaller: false,
                                 ),
                               ),
@@ -593,7 +618,7 @@ class IncomingCallScreen extends StatelessWidget {
                             shape: BoxShape.circle,
                           ),
                           child: Icon(
-                            isVideo ? Icons.videocam : Icons.phone,
+                            widget.isVideo ? Icons.videocam : Icons.phone,
                             color: Colors.white,
                             size: 32,
                           ),

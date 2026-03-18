@@ -47,35 +47,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final uid = _auth.currentUser?.uid;
     if (uid != null) {
       PresenceService.setOnline(uid);
-      _listenForCalls(uid);
     }
   }
 
-  StreamSubscription? _callSub;
-  void _listenForCalls(String uid) {
-    AgoraService.init();
-    _callSub = AgoraService.watchIncomingCall(uid).listen((event) {
-      if (!mounted) return;
-      final val = event.snapshot.value;
-      if (val is Map && val['status'] == 'ringing') {
-        // Prevent multiple screens if already on a call screen or similar
-        // For now, simple push
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => IncomingCallScreen(
-              callerName: val['callerName'] ?? 'Unknown Caller',
-              callerPhoto: val['callerPhoto'] ?? '',
-              callId: val['callId'],
-              callerId: val['callerId'],
-              myId: uid,
-              isVideo: val['isVideo'] == true,
-            ),
-          ),
-        );
-      }
-    });
-  }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -88,7 +62,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _positionStreamSubscription?.cancel();
-    _callSub?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }

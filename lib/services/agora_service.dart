@@ -3,6 +3,7 @@
 // ════════════════════════════════════════════════════════════════
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:my_app1/services/fcm_service.dart';
 
 class AgoraService {
   // ── REPLACE WITH YOUR AGORA APP ID ──
@@ -40,6 +41,21 @@ class AgoraService {
       'status': 'ringing',
       'timestamp': ServerValue.timestamp,
     });
+
+    // 🔔 Send High-Priority Push Notification to wake up/notify the receiver
+    await FcmService.sendNotification(
+      receiverUid: receiverId,
+      title: isVideo ? 'Video Call' : 'Voice Call',
+      body: '$callerName is calling you...',
+      data: {
+        'type': 'incoming_call',
+        'callId': callId,
+        'callerId': callerId,
+        'callerName': callerName,
+        'callerPhoto': callerPhoto,
+        'isVideo': isVideo.toString(),
+      },
+    );
   }
 
   // ── Cancel / end call invite ──

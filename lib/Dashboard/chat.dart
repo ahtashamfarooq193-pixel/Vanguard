@@ -702,8 +702,8 @@ class _ChatSelectionScreenState extends State<ChatSelectionScreen> {
             ),
           ),
       ]),
-      title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17, color: Color(0xff250D57))),
-      subtitle: Text(subtitle, style: TextStyle(color: unread > 0 ? const Color(0xff250D57) : Colors.grey, fontSize: 14, fontWeight: unread > 0 ? FontWeight.w600 : FontWeight.normal)),
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17, color: Color(0xff250D57))),
+      subtitle: Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: unread > 0 ? const Color(0xff250D57) : Colors.grey, fontSize: 14, fontWeight: unread > 0 ? FontWeight.w600 : FontWeight.normal)),
       trailing: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.end, children: [
         if (time != null && time.isNotEmpty) Text(time, style: TextStyle(color: unread > 0 ? const Color(0xff38B6FF) : Colors.grey, fontSize: 12)),
         if (unread > 0)
@@ -1289,14 +1289,17 @@ class _ChatState extends State<Chat> with WidgetsBindingObserver {
             }
           ),
           const SizedBox(width: 12),
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(widget.friendName ?? 'Vanguard AI', style: const TextStyle(color: theme, fontSize: 16, fontWeight: FontWeight.bold)),
-            if (widget.chatType != 'ai')
-              Text(
-                isTyping ? 'typing...' : (_friendOnline ? 'Online' : PresenceService.formatLastSeen(_lastSeen)),
-                style: TextStyle(color: isTyping ? accent : (_friendOnline ? Colors.green : Colors.grey), fontSize: 11, fontWeight: FontWeight.w600),
-              ),
-          ]),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(widget.friendName ?? 'Vanguard AI', style: const TextStyle(color: theme, fontSize: 16, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
+              if (widget.chatType != 'ai')
+                Text(
+                  isTyping ? 'typing...' : (_friendOnline ? 'Online' : PresenceService.formatLastSeen(_lastSeen)),
+                  style: TextStyle(color: isTyping ? accent : (_friendOnline ? Colors.green : Colors.grey), fontSize: 11, fontWeight: FontWeight.w600),
+                  overflow: TextOverflow.ellipsis,
+                ),
+            ]),
+          ),
         ]),
         actions: widget.chatType == 'ai' ? [] : [
           // Voice Call
